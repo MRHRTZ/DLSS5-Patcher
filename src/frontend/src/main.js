@@ -1,0 +1,620 @@
+import './style.css';
+import './app.css';
+import { DetectGames, BrowseExe, GetGameFolderPreview, GetGameDetails, PatchGame, LaunchGame, GetAppVersion, UninstallPatch } from '../wailsjs/go/main/App';
+import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime';
+
+document.querySelector('#app').innerHTML = `
+  <div class="container">
+    <header class="header">
+      <h1>DLSS 5 Patcher</h1>
+    </header>
+
+    <main class="main">
+      <section class="game-selection">
+        <div class="section-header">
+          <h2>Select Game</h2>
+          <div class="header-controls">
+            <div class="search-box">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+              <input type="text" id="searchInput" placeholder="Search game..." aria-label="Search game">
+              <button id="clearSearchBtn" class="clear-btn" style="display: none;" title="Clear search">&times;</button>
+            </div>
+            <button id="refreshBtn" class="btn-icon" title="Refresh game list" aria-label="Refresh game list">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div class="game-list-container">
+          <div id="gameList" class="game-list"></div>
+        </div>
+        <div id="scanStatusText" class="scan-status-text" style="display: none; margin-bottom: 20px;"></div>
+        <div class="browse-section">
+          <button id="browseBtn" class="btn btn-secondary">Browse Game Executable</button>
+        </div>
+      </section>
+
+      <section class="preview-section" id="previewSection" style="display: none;">
+        <h2>Game Preview</h2>
+        <div class="folder-path" id="folderPath" style="display:none;"></div>
+        <div class="folder-contents" id="folderContents"></div>
+      </section>
+
+      <section class="action-section">
+        <div id="patchSection" style="display: none;">
+          <button id="patchBtn" class="btn btn-primary btn-large">Patch Game (Install ReShade + DLSS 5)</button>
+          <button id="uninstallBtn" class="btn btn-danger btn-large" style="display: none;">Uninstall Patch (Remove ReShade + DLSS 5)</button>
+          <div id="patchProgress" class="progress" style="display: none;">
+            <div class="progress-bar" id="progressBar"></div>
+          </div>
+          <div id="patchResult" class="result"></div>
+        </div>
+        <div id="launchSection" style="display: none;">
+          <button id="launchBtn" class="btn btn-success btn-large">Launch Game</button>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-content">
+        <p>Created by <a href="https://github.com/MRHRTZ" target="_blank" class="footer-link">MRHRTZ</a></p>
+        <div class="footer-buttons">
+          <button id="discordBtn" class="btn btn-discord">MNXMN Community</button>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <div id="customModal" class="modal-overlay" style="display: none;">
+    <div class="modal-container">
+      <div class="modal-header">
+        <h3 id="modalTitle">Confirm Uninstall</h3>
+        <button id="modalCloseBtn" class="modal-close-btn" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-footer">
+        <button id="modalCancelBtn" class="btn btn-secondary">Cancel</button>
+        <button id="modalConfirmBtn" class="btn btn-danger">Uninstall</button>
+      </div>
+    </div>
+  </div>
+`;
+
+let selectedGame = null;
+let games = [];
+let isScanning = false;
+let searchQuery = '';
+
+// Normalize game object to have consistent lowercase property keys
+function normalizeGame(game) {
+  if (!game) return null;
+  return {
+    name: game.name || game.Name || 'Unknown Game',
+    path: game.path || game.Path || '',
+    exePath: game.exePath || game.ExePath || '',
+    isInstalled: !!(game.isInstalled ?? game.IsInstalled),
+    detectedAPI: (game.detectedAPI || game.DetectedAPI || 'dxgi').toLowerCase()
+  };
+}
+
+// Wails Event Listeners for live scanning
+EventsOn('scan:status', (msg) => {
+  const elem = document.getElementById('scanStatusText');
+  if (!elem) return;
+  if (msg && msg.trim()) {
+    elem.style.display = 'block';
+    elem.textContent = msg;
+  } else {
+    elem.style.display = 'none';
+    elem.textContent = '';
+  }
+});
+
+EventsOn('scan:game', (rawGame) => {
+  const game = normalizeGame(rawGame);
+  if (!game || !game.path) return;
+  const exists = games.some(g => g.path.toLowerCase() === game.path.toLowerCase());
+  if (!exists) {
+    games.push(game);
+    renderGameList();
+  }
+});
+
+EventsOn('scan:complete', () => {
+  isScanning = false;
+  const elem = document.getElementById('scanStatusText');
+  if (elem) {
+    elem.style.display = 'none';
+    elem.textContent = '';
+  }
+  const refreshBtn = document.getElementById('refreshBtn');
+  if (refreshBtn) {
+    refreshBtn.disabled = false;
+    refreshBtn.classList.remove('spinning');
+  }
+});
+
+// Load games on startup sequentially with real-time UI updates
+async function loadGames() {
+  games = [];
+  isScanning = true;
+  const gameList = document.getElementById('gameList');
+  gameList.innerHTML = '<div class="loading">Searching for installed games...</div>';
+
+  try {
+    const rawGames = await DetectGames();
+    if (rawGames && rawGames.length > 0) {
+      rawGames.forEach(rg => {
+        const game = normalizeGame(rg);
+        if (game && game.path && !games.some(g => g.path.toLowerCase() === game.path.toLowerCase())) {
+          games.push(game);
+        }
+      });
+    }
+    renderGameList();
+  } catch (err) {
+    console.error('Failed to detect games:', err);
+    gameList.innerHTML = '<div class="error">Failed to detect games. Click "Browse Game Executable" to select manually.</div>';
+  } finally {
+    isScanning = false;
+    const elem = document.getElementById('scanStatusText');
+    if (elem) {
+      elem.style.display = 'none';
+      elem.textContent = '';
+    }
+    const refreshBtn = document.getElementById('refreshBtn');
+    if (refreshBtn) {
+      refreshBtn.disabled = false;
+      refreshBtn.classList.remove('spinning');
+    }
+  }
+}
+
+function renderGameList() {
+  const gameList = document.getElementById('gameList');
+
+  const filteredGames = games.filter(g => {
+    if (!searchQuery) return true;
+    return (g.name && g.name.toLowerCase().includes(searchQuery)) ||
+           (g.path && g.path.toLowerCase().includes(searchQuery));
+  });
+
+  if (!filteredGames || filteredGames.length === 0) {
+    if (searchQuery) {
+      gameList.innerHTML = `<div class="empty">No games match "${searchQuery}"</div>`;
+    } else {
+      gameList.innerHTML = '<div class="empty">No games found. Click "Browse Game Executable" to select manually.</div>';
+    }
+    return;
+  }
+
+  gameList.innerHTML = filteredGames.map((game) => {
+    const originalIndex = games.findIndex(g => g.path.toLowerCase() === game.path.toLowerCase());
+    const isSelected = selectedGame && selectedGame.path.toLowerCase() === game.path.toLowerCase();
+    return `
+      <div class="game-item ${game.isInstalled ? 'installed' : ''} ${isSelected ? 'selected' : ''}" data-index="${originalIndex}">
+        <div class="game-info">
+          <div class="game-header">
+            <span class="game-name">${game.name}</span>
+            <span class="api-badge">⚙️ ${game.detectedAPI.toUpperCase()}</span>
+          </div>
+          <span class="game-path">${game.path}</span>
+          ${game.isInstalled ? '<span class="badge badge-success">DLSS 5 Installed</span>' : '<span class="badge badge-warning">Not Patched</span>'}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  document.querySelectorAll('.game-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const index = parseInt(item.dataset.index);
+      if (games[index]) {
+        selectGame(games[index]);
+      }
+    });
+  });
+}
+
+async function selectGame(game) {
+  if (!game) return;
+  selectedGame = normalizeGame(game);
+
+  document.querySelectorAll('.game-item').forEach(item => {
+    const index = parseInt(item.dataset.index);
+    if (games[index] && games[index].path.toLowerCase() === selectedGame.path.toLowerCase()) {
+      item.classList.add('selected');
+    } else {
+      item.classList.remove('selected');
+    }
+  });
+
+  const previewSection = document.getElementById('previewSection');
+  const folderContents = document.getElementById('folderContents');
+
+  previewSection.style.display = 'block';
+  folderContents.innerHTML = `<div class="loading">Loading component details...</div>`;
+
+  try {
+    const details = await GetGameDetails(selectedGame.path || selectedGame.exePath);
+    
+    if (details && details.isInstalled !== undefined) {
+      selectedGame.isInstalled = !!details.isInstalled;
+    }
+
+    const initial = (details.name || selectedGame.name || 'G').charAt(0).toUpperCase();
+
+    folderContents.innerHTML = `
+      <div class="game-details-card">
+        <div class="details-header">
+          <div class="game-avatar">${initial}</div>
+          <div class="game-title-group">
+            <h3 class="game-title">${details.name || selectedGame.name}</h3>
+            <div class="game-subtitle">Game folder:</div>
+            <div class="game-folder-path">${details.path || selectedGame.path}</div>
+          </div>
+        </div>
+
+        <div class="details-table">
+          <div class="details-row">
+            <span class="row-label">Executable</span>
+            <span class="row-value exe-value">${details.executable || selectedGame.exePath}</span>
+          </div>
+          <div class="details-row">
+            <span class="row-label">Rendering API</span>
+            <span class="row-value api-value">${details.renderingAPI || 'DirectX 12'}</span>
+          </div>
+          <div class="details-row">
+            <span class="row-label">DLSS</span>
+            <span class="row-value ${details.dlssVersion !== 'Not Available' ? 'status-green' : 'status-muted'}">${details.dlssVersion || 'Not Available'}</span>
+          </div>
+          <div class="details-row">
+            <span class="row-label">DLSS 5 add-on</span>
+            <span class="row-value ${details.dlss5Addon === 'Installed' ? 'status-green' : 'status-muted'}">${details.dlss5Addon || 'Not Installed'}</span>
+          </div>
+          <div class="details-row">
+            <span class="row-label">ReShade</span>
+            <span class="row-value ${details.reshadeStatus !== 'Not Installed' ? 'status-green' : 'status-muted'}">${details.reshadeStatus || 'Not Installed'}</span>
+          </div>
+        </div>
+
+        ${details.dllList && details.dllList.length > 0 ? `
+          <div class="dll-table-container">
+            <div class="dll-table-header">Detected Streamline & DLSS Files</div>
+            <div class="dll-list-scroll">
+              ${details.dllList.map(dll => `
+                <div class="dll-row">
+                  <span class="dll-path">${dll.relPath}</span>
+                  <span class="dll-version">${dll.version || 'Unknown'}</span>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        ` : ''}
+      </div>
+    `;
+  } catch (err) {
+    console.error('Failed to get game details:', err);
+    folderContents.innerHTML = `
+      <div class="folder-item">📁 <strong>Folder:</strong> ${selectedGame.path || 'Unknown path'}</div>
+      <div class="folder-item">🎮 <strong>Executable:</strong> ${selectedGame.exePath || 'Unknown executable'}</div>
+    `;
+  }
+
+  document.getElementById('patchSection').style.display = 'block';
+  document.getElementById('launchSection').style.display = 'block';
+
+  const patchBtn = document.getElementById('patchBtn');
+  const uninstallBtn = document.getElementById('uninstallBtn');
+  
+  if (selectedGame.isInstalled) {
+    patchBtn.textContent = 'Re-Patch Game (Reinstall ReShade + DLSS 5)';
+    uninstallBtn.style.display = 'block';
+  } else {
+    patchBtn.textContent = 'Patch Game (Install ReShade + DLSS 5)';
+    uninstallBtn.style.display = 'none';
+  }
+}
+
+async function handleBrowseExe() {
+  try {
+    const exePath = await BrowseExe();
+    if (!exePath) return;
+
+    const gameInfo = await GetGameFolderPreview(exePath);
+    const normalized = normalizeGame(gameInfo);
+    if (!normalized.exePath) normalized.exePath = exePath;
+
+    const existingIndex = games.findIndex(g => g.path.toLowerCase() === normalized.path.toLowerCase());
+    if (existingIndex !== -1) {
+      games[existingIndex] = normalized;
+    } else {
+      games.unshift(normalized);
+    }
+
+    renderGameList();
+    selectGame(normalized);
+  } catch (err) {
+    console.error('Browse failed:', err);
+    showResult('error', 'Failed to browse for executable');
+  }
+}
+
+async function handlePatch() {
+  if (!selectedGame || !selectedGame.path) {
+    showResult('error', 'Please select a game first');
+    return;
+  }
+
+  const patchBtn = document.getElementById('patchBtn');
+  const patchProgress = document.getElementById('patchProgress');
+  const progressBar = document.getElementById('progressBar');
+  const patchResult = document.getElementById('patchResult');
+
+  patchBtn.disabled = true;
+  patchBtn.textContent = 'Patching...';
+  patchProgress.style.display = 'block';
+  progressBar.style.width = '0%';
+  patchResult.innerHTML = '';
+
+  let progress = 0;
+  const progressInterval = setInterval(() => {
+    progress += Math.random() * 12;
+    if (progress > 90) progress = 90;
+    progressBar.style.width = progress + '%';
+  }, 200);
+
+  try {
+    const result = await PatchGame(selectedGame.path);
+    clearInterval(progressInterval);
+    progressBar.style.width = '100%';
+
+    if (result.success || result.Success) {
+      showResult('success', result.message || result.Message);
+      selectedGame.isInstalled = true;
+      
+      const index = games.findIndex(g => g.path.toLowerCase() === selectedGame.path.toLowerCase());
+      if (index !== -1) {
+        games[index].isInstalled = true;
+      }
+      
+      renderGameList();
+      selectGame(selectedGame);
+    } else {
+      showResult('error', result.message || result.Message);
+    }
+  } catch (err) {
+    clearInterval(progressInterval);
+    showResult('error', 'Patch failed: ' + err);
+  } finally {
+    patchBtn.disabled = false;
+    if (selectedGame.isInstalled) {
+      patchBtn.textContent = 'Re-Patch Game (Reinstall ReShade + DLSS 5)';
+    } else {
+      patchBtn.textContent = 'Patch Game (Install ReShade + DLSS 5)';
+    }
+    setTimeout(() => {
+      patchProgress.style.display = 'none';
+    }, 1000);
+  }
+}
+
+async function handleLaunch() {
+  if (!selectedGame || !selectedGame.exePath) {
+    showResult('error', 'Game executable path not found');
+    return;
+  }
+
+  const launchBtn = document.getElementById('launchBtn');
+  launchBtn.disabled = true;
+  launchBtn.textContent = 'Launching...';
+
+  try {
+    const result = await LaunchGame(selectedGame.exePath);
+    if (result.success || result.Success) {
+      showResult('success', result.message || result.Message);
+    } else {
+      showResult('error', result.message || result.Message);
+    }
+  } catch (err) {
+    showResult('error', 'Launch failed: ' + err);
+  } finally {
+    launchBtn.disabled = false;
+    launchBtn.textContent = 'Launch Game';
+  }
+}
+
+function showConfirmModal({ title = 'Confirm Uninstall', bodyHtml = '', confirmText = 'Uninstall', cancelText = 'Cancel' } = {}) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('customModal');
+    const modalTitle = document.getElementById('modalTitle');
+    const modalBody = document.getElementById('modalBody');
+    const modalConfirmBtn = document.getElementById('modalConfirmBtn');
+    const modalCancelBtn = document.getElementById('modalCancelBtn');
+    const modalCloseBtn = document.getElementById('modalCloseBtn');
+
+    if (!modal) return resolve(false);
+
+    modalTitle.innerHTML = title;
+    modalBody.innerHTML = bodyHtml;
+    modalConfirmBtn.textContent = confirmText;
+    modalCancelBtn.textContent = cancelText;
+
+    modal.style.display = 'flex';
+
+    function cleanup(result) {
+      modal.style.display = 'none';
+      modalConfirmBtn.removeEventListener('click', onConfirm);
+      modalCancelBtn.removeEventListener('click', onCancel);
+      modalCloseBtn.removeEventListener('click', onCancel);
+      modal.removeEventListener('click', onOverlayClick);
+      resolve(result);
+    }
+
+    function onConfirm() { cleanup(true); }
+    function onCancel() { cleanup(false); }
+    function onOverlayClick(e) {
+      if (e.target === modal) cleanup(false);
+    }
+
+    modalConfirmBtn.addEventListener('click', onConfirm);
+    modalCancelBtn.addEventListener('click', onCancel);
+    modalCloseBtn.addEventListener('click', onCancel);
+    modal.addEventListener('click', onOverlayClick);
+  });
+}
+
+async function handleUninstall() {
+  if (!selectedGame || !selectedGame.path) {
+    showResult('error', 'Please select a game first');
+    return;
+  }
+
+  const confirmed = await showConfirmModal({
+    title: '⚠️ Uninstall DLSS 5 & ReShade',
+    bodyHtml: `
+      <p>Are you sure you want to uninstall ReShade and DLSS 5 from <strong>${selectedGame.name}</strong>?</p>
+      <p>This will remove:</p>
+      <ul>
+        <li>ReShade DLL files (from root & binary folders)</li>
+        <li>DLSS 5 addon & DLL files</li>
+        <li>Shader & preset files</li>
+      </ul>
+      <p>Original backed up files will be restored automatically.</p>
+    `,
+    confirmText: 'Uninstall Patch',
+    cancelText: 'Cancel'
+  });
+
+  if (!confirmed) {
+    return;
+  }
+
+  const uninstallBtn = document.getElementById('uninstallBtn');
+  const patchProgress = document.getElementById('patchProgress');
+  const progressBar = document.getElementById('progressBar');
+  const patchResult = document.getElementById('patchResult');
+
+  uninstallBtn.disabled = true;
+  uninstallBtn.textContent = 'Uninstalling...';
+  patchProgress.style.display = 'block';
+  progressBar.style.width = '0%';
+  patchResult.innerHTML = '';
+
+  let progress = 0;
+  const progressInterval = setInterval(() => {
+    progress += Math.random() * 15;
+    if (progress > 90) progress = 90;
+    progressBar.style.width = progress + '%';
+  }, 150);
+
+  try {
+    const result = await UninstallPatch(selectedGame.path);
+    clearInterval(progressInterval);
+    progressBar.style.width = '100%';
+
+    if (result.success || result.Success) {
+      showResult('success', result.message || result.Message);
+      selectedGame.isInstalled = false;
+      
+      const index = games.findIndex(g => g.path.toLowerCase() === selectedGame.path.toLowerCase());
+      if (index !== -1) {
+        games[index].isInstalled = false;
+      }
+      
+      renderGameList();
+      selectGame(selectedGame);
+    } else {
+      showResult('error', result.message || result.Message);
+    }
+  } catch (err) {
+    clearInterval(progressInterval);
+    showResult('error', 'Uninstall failed: ' + err);
+  } finally {
+    uninstallBtn.disabled = false;
+    uninstallBtn.textContent = 'Uninstall Patch (Remove ReShade + DLSS 5)';
+    setTimeout(() => {
+      patchProgress.style.display = 'none';
+    }, 1000);
+  }
+}
+
+function showResult(type, message) {
+  const patchResult = document.getElementById('patchResult');
+  patchResult.className = `result ${type}`;
+  patchResult.innerHTML = message;
+}
+
+// Search input handling
+document.getElementById('searchInput')?.addEventListener('input', (e) => {
+  searchQuery = e.target.value.trim().toLowerCase();
+  const clearBtn = document.getElementById('clearSearchBtn');
+  if (clearBtn) {
+    clearBtn.style.display = searchQuery ? 'block' : 'none';
+  }
+  renderGameList();
+});
+
+document.getElementById('clearSearchBtn')?.addEventListener('click', () => {
+  const searchInput = document.getElementById('searchInput');
+  if (searchInput) searchInput.value = '';
+  searchQuery = '';
+  const clearBtn = document.getElementById('clearSearchBtn');
+  if (clearBtn) clearBtn.style.display = 'none';
+  renderGameList();
+});
+
+// Load version
+async function loadVersion() {
+  try {
+    const version = await GetAppVersion();
+    const versionElem = document.getElementById('version');
+    if (versionElem) {
+      versionElem.textContent = version;
+    }
+  } catch (err) {
+    console.error('Failed to get version:', err);
+  }
+}
+
+// Event listeners
+async function handleRefresh() {
+  const refreshBtn = document.getElementById('refreshBtn');
+  if (refreshBtn) {
+    refreshBtn.disabled = true;
+    refreshBtn.classList.add('spinning');
+  }
+  await loadGames();
+  if (refreshBtn) {
+    refreshBtn.disabled = false;
+    refreshBtn.classList.remove('spinning');
+  }
+}
+
+document.getElementById('refreshBtn')?.addEventListener('click', handleRefresh);
+document.getElementById('browseBtn').addEventListener('click', handleBrowseExe);
+document.getElementById('patchBtn').addEventListener('click', handlePatch);
+document.getElementById('uninstallBtn').addEventListener('click', handleUninstall);
+document.getElementById('launchBtn').addEventListener('click', handleLaunch);
+document.getElementById('discordBtn').addEventListener('click', (e) => {
+  e.preventDefault();
+  BrowserOpenURL('https://discord.gg/DZRMwdnYs');
+});
+
+document.addEventListener('click', (e) => {
+  const link = e.target.closest('a[href]');
+  if (link) {
+    const href = link.getAttribute('href');
+    if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
+      e.preventDefault();
+      BrowserOpenURL(href);
+    }
+  }
+});
+
+// Initialize
+loadGames();
+loadVersion();

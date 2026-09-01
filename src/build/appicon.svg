@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+    <defs>
+        <!-- Background Gradient -->
+        <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#0B3D18" />
+            <stop offset="100%" stop-color="#1B853F" />
+        </linearGradient>
+        
+        <!-- Highlight Gradient for Border and Accents -->
+        <linearGradient id="highlightGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#38EF7D" />
+            <stop offset="100%" stop-color="#11998E" />
+        </linearGradient>
+        
+        <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+            <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000000" flood-opacity="0.3"/>
+        </filter>
+    </defs>
+    
+    <!-- Rounded Rectangle Background -->
+    <rect width="512" height="512" rx="120" fill="url(#bgGrad)" />
+    
+    <!-- Subtle Inner Border -->
+    <rect x="24" y="24" width="464" height="464" rx="96" fill="none" stroke="url(#highlightGrad)" stroke-width="4" opacity="0.6" />
+    
+    <!-- Logo Text -->
+    <text x="256" y="295" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="190" font-weight="900" fill="#FFFFFF" text-anchor="middle" dominant-baseline="middle" letter-spacing="2" filter="url(#shadow)">D5P</text>
+    
+    <!-- Decorative Professional Accent Line -->
+    <path d="M 176 410 L 336 410" stroke="url(#highlightGrad)" stroke-width="8" stroke-linecap="round" />
+</svg>
