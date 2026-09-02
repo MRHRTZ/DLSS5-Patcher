@@ -22,6 +22,8 @@ export function InstallDLSS5(arg1:string):Promise<main.PatchResult>;
 
 export function InstallReshade(arg1:string):Promise<main.PatchResult>;
 
+export function KillGameProcess(arg1:string):Promise<string>;
+
 export function LaunchGame(arg1:string):Promise<main.PatchResult>;
 
 export function PatchGame(arg1:string):Promise<main.PatchResult>;

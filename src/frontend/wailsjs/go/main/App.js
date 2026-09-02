@@ -42,6 +42,10 @@ export function InstallReshade(arg1) {
   return window['go']['main']['App']['InstallReshade'](arg1);
 }
 
+export function KillGameProcess(arg1) {
+  return window['go']['main']['App']['KillGameProcess'](arg1);
+}
+
 export function LaunchGame(arg1) {
   return window['go']['main']['App']['LaunchGame'](arg1);
 }

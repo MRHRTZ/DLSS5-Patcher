@@ -1,6 +1,6 @@
 import './style.css';
 import './app.css';
-import { DetectGames, BrowseExe, GetGameFolderPreview, GetGameDetails, PatchGame, LaunchGame, GetAppVersion, UninstallPatch } from '../wailsjs/go/main/App';
+import { DetectGames, BrowseExe, GetGameFolderPreview, GetGameDetails, PatchGame, LaunchGame, GetAppVersion, UninstallPatch, KillGameProcess } from '../wailsjs/go/main/App';
 import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime';
 
 document.querySelector('#app').innerHTML = `
@@ -384,7 +384,12 @@ async function handlePatch() {
       renderGameList();
       selectGame(selectedGame);
     } else {
-      showResult('error', result.message || result.Message);
+      const msg = result.message || result.Message;
+      if (isRunningBlocked(msg)) {
+        showRunningBlocked(msg, selectedGame.path, handlePatch);
+      } else {
+        showResult('error', msg);
+      }
     }
   } catch (err) {
     clearInterval(progressInterval);
@@ -528,7 +533,12 @@ async function handleUninstall() {
       renderGameList();
       selectGame(selectedGame);
     } else {
-      showResult('error', result.message || result.Message);
+      const msg = result.message || result.Message;
+      if (isRunningBlocked(msg)) {
+        showRunningBlocked(msg, selectedGame.path, handleUninstall);
+      } else {
+        showResult('error', msg);
+      }
     }
   } catch (err) {
     clearInterval(progressInterval);
@@ -546,6 +556,47 @@ function showResult(type, message) {
   const patchResult = document.getElementById('patchResult');
   patchResult.className = `result ${type}`;
   patchResult.innerHTML = message;
+}
+
+function isRunningBlocked(message) {
+  return typeof message === 'string' && message.toLowerCase().includes('currently running');
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+async function endTaskAndRetry(gamePath, retryFn, btn) {
+  if (!gamePath || !retryFn) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Ending task...';
+  }
+  try {
+    const killed = await KillGameProcess(gamePath);
+    showResult('success', `Ended ${killed}. Retrying...`);
+  } catch (err) {
+    showResult('error', String(err));
+    return;
+  }
+  setTimeout(() => retryFn(),800);
+}
+
+function showRunningBlocked(message, gamePath, retryFn) {
+  const patchResult = document.getElementById('patchResult');
+  patchResult.className = 'result error';
+  patchResult.innerHTML = `
+    <div>${escapeHtml(message)}</div>
+    <button id="endTaskBtn" class="btn btn-danger btn-small" style="margin-top: 6px;">End Task &amp; Try Again</button>
+  `;
+  document.getElementById('endTaskBtn').addEventListener('click', (e) => {
+    endTaskAndRetry(gamePath, retryFn, e.currentTarget);
+  });
 }
 
 // Search input handling

@@ -4,15 +4,15 @@ import (
 	"bytes"
 	"context"
 	"debug/pe"
-	"fmt"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	goruntime "runtime"
 	"regexp"
+	goruntime "runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -244,16 +244,16 @@ func getDLLFileVersion(filePath string) string {
 
 // Process Snapshot for running game detection
 type PROCESSENTRY32W struct {
-	Size              uint32
-	Usage             uint32
-	ProcessID         uint32
-	DefaultHeapID     uintptr
-	ModuleID          uint32
-	Threads           uint32
-	ParentProcessID   uint32
-	PriClassBase      int32
-	Flags             uint32
-	ExeFile           [260]uint16
+	Size            uint32
+	Usage           uint32
+	ProcessID       uint32
+	DefaultHeapID   uintptr
+	ModuleID        uint32
+	Threads         uint32
+	ParentProcessID uint32
+	PriClassBase    int32
+	Flags           uint32
+	ExeFile         [260]uint16
 }
 
 // getRunningProcesses returns a set of lowercase executable names currently running on Windows
@@ -273,6 +273,33 @@ func getRunningProcesses() map[string]bool {
 			exeName := syscall.UTF16ToString(entry.ExeFile[:])
 			if exeName != "" {
 				procs[strings.ToLower(exeName)] = true
+			}
+			if err := syscall.Process32Next(snapshot, (*syscall.ProcessEntry32)(unsafe.Pointer(&entry))); err != nil {
+				break
+			}
+		}
+	}
+	return procs
+}
+
+// getRunningProcessPIDs returns a map of lower-cased executable name -> PID
+// for every running process, so callers can force-terminate a game.
+func getRunningProcessPIDs() map[string]uint32 {
+	procs := make(map[string]uint32)
+	snapshot, err := syscall.CreateToolhelp32Snapshot(syscall.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return procs
+	}
+	defer syscall.CloseHandle(snapshot)
+
+	var entry PROCESSENTRY32W
+	entry.Size = uint32(unsafe.Sizeof(entry))
+
+	if err := syscall.Process32First(snapshot, (*syscall.ProcessEntry32)(unsafe.Pointer(&entry))); err == nil {
+		for {
+			exeName := syscall.UTF16ToString(entry.ExeFile[:])
+			if exeName != "" {
+				procs[strings.ToLower(exeName)] = entry.ProcessID
 			}
 			if err := syscall.Process32Next(snapshot, (*syscall.ProcessEntry32)(unsafe.Pointer(&entry))); err != nil {
 				break
@@ -315,10 +342,75 @@ func (a *App) isGameRunning(gamePath string) (bool, string) {
 	return false, ""
 }
 
+// KillGameProcess force-terminates the running game process(es) for a game.
+// Returns the names of the processes that were ended. Used by the front-end to
+// offer an "End Task" escape hatch when a patch/uninstall is blocked because the
+// game is still running.
+func (a *App) KillGameProcess(gamePath string) (string, error) {
+	if strings.TrimSpace(gamePath) == "" {
+		return "", fmt.Errorf("game path cannot be empty")
+	}
+
+	targetDir, targetExe, launchExe, _, err := a.resolveGameTarget(gamePath)
+	if err != nil {
+		return "", err
+	}
+
+	exes := []string{}
+	addExe := func(e string) {
+		if e == "" {
+			return
+		}
+		name := strings.ToLower(filepath.Base(e))
+		if name != "" && !isIgnoredExe(name) {
+			exes = append(exes, name)
+		}
+	}
+	addExe(targetExe)
+	addExe(launchExe)
+	if topExes, err := filepath.Glob(filepath.Join(targetDir, "*.exe")); err == nil {
+		for _, e := range topExes {
+			addExe(e)
+		}
+	}
+
+	if len(exes) == 0 {
+		return "", fmt.Errorf("no game executable resolved")
+	}
+
+	pids := getRunningProcessPIDs()
+	killed := []string{}
+	for _, exe := range exes {
+		if pid, ok := pids[exe]; ok {
+			cmd := exec.Command("taskkill", "/PID", fmt.Sprintf("%d", pid), "/F")
+			if out, err := cmd.CombinedOutput(); err == nil {
+				killed = append(killed, exe)
+				writeLog(fmt.Sprintf("KillGameProcess: Terminated %s (PID %d)", exe, pid))
+			} else {
+				writeLog(fmt.Sprintf("KillGameProcess: Failed to terminate %s (PID %d): %v (%s)", exe, pid, err, strings.TrimSpace(string(out))))
+			}
+		}
+	}
+
+	if len(killed) == 0 {
+		return "", fmt.Errorf("no running game process found to end task")
+	}
+	return strings.Join(killed, ", "), nil
+}
+
 // App struct
 type App struct {
-	ctx             context.Context
+	ctx              context.Context
 	preExistingFiles map[string]bool
+	diagnostic       bool
+}
+
+// emitEvent no-ops in CLI diagnostic mode where there is no UI context.
+func (a *App) emitEvent(name string, data ...interface{}) {
+	if a.diagnostic || a.ctx == nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, name, data...)
 }
 
 // GameInfo represents a detected game
@@ -403,6 +495,7 @@ func isIgnoredExe(filename string) bool {
 		"autohotkey", "cheatengine", "cheat engine", "cpuz", "diskinfo",
 		"diskmark", "node", "npm", "git", "python", "code", "chrome",
 		"firefox", "cmd", "powershell", "vanguard", "easyanticheat",
+		"trainer", "fling", "plitch", "cheat", "godmode", "plus 26 trainer",
 	}
 	for _, pattern := range ignoredPatterns {
 		if strings.Contains(name, pattern) {
@@ -485,6 +578,43 @@ func (a *App) allRootExes(gameDir string) []string {
 	}
 	sort.Strings(rootExes)
 	return rootExes
+}
+
+// bestRootGameExe picks the most likely main game executable from the root
+// folder. The main game.exe is almost always the LARGEST executable, and (for
+// 3D games) the one that imports a rendering API. Handlers/helpers/setups are
+// ignored, so the winner is: biggest API-importing exe, else biggest exe.
+func (a *App) bestRootGameExe(gameDir string) (string, string) {
+	var bestAPI, bestAny string
+	var bestAPISize, bestAnySize int64
+
+	exes, _ := singleLevelExes(gameDir)
+	for _, exe := range exes {
+		base := filepath.Base(exe)
+		if isIgnoredExe(base) {
+			continue
+		}
+		info, err := os.Stat(exe)
+		if err != nil {
+			continue
+		}
+		if api := a.hasApiImports(exe); api.api != "" && info.Size() > bestAPISize {
+			bestAPI = exe
+			bestAPISize = info.Size()
+		}
+		if info.Size() > bestAnySize {
+			bestAny = exe
+			bestAnySize = info.Size()
+		}
+	}
+
+	if bestAPI != "" {
+		return bestAPI, filepath.Dir(bestAPI)
+	}
+	if bestAny != "" {
+		return bestAny, filepath.Dir(bestAny)
+	}
+	return "", ""
 }
 
 // hasApiImports inspects a PE's import table and reports any recognized
@@ -637,16 +767,6 @@ func (a *App) resolveGameTarget(gamePathOrExe string) (targetDir string, targetE
 	// still the actual game. Keep the shipping binary as the primary target.
 	// Add-ons, DXGI hooks and DLSS DLLs are spread to every hook directory by
 	// InstallDLSS5 / InstallReshade anyway.
-	if targetExe == "" {
-		topExes, _ := filepath.Glob(filepath.Join(gameDir, "*.exe"))
-		for _, exe := range topExes {
-			if !isIgnoredExe(filepath.Base(exe)) {
-				targetExe = exe
-				targetDir = gameDir
-				break
-			}
-		}
-	}
 
 	if targetExe == "" && !stat.IsDir() {
 		if !isIgnoredExe(filepath.Base(cleanPath)) {
@@ -658,14 +778,12 @@ func (a *App) resolveGameTarget(gamePathOrExe string) (targetDir string, targetE
 	// Repacked releases keep multiple identical cracked executables in side
 	// folders (_crack, _original files, ...). For a normal game folder the root
 	// launcher is always the one the player runs, so make it the fallback.
+	//
+	// The main game executable is (almost) always the LARGEST exe in the root
+	// folder, and the one that actually imports a rendering API. Prefer the
+	// biggest API-importing exe, then the biggest exe overall.
 	if targetExe == "" {
-		for _, exe := range a.allRootExes(gameDir) {
-			if !isIgnoredExe(filepath.Base(exe)) {
-				targetExe = exe
-				targetDir = filepath.Dir(exe)
-				break
-			}
-		}
+		targetExe, targetDir = a.bestRootGameExe(gameDir)
 	}
 
 	if targetExe == "" {
@@ -673,13 +791,7 @@ func (a *App) resolveGameTarget(gamePathOrExe string) (targetDir string, targetE
 	}
 
 	if launchExe == "" {
-		rootExes := a.allRootExes(gameDir)
-		for _, exe := range rootExes {
-			if !isIgnoredExe(filepath.Base(exe)) {
-				launchExe = exe
-				break
-			}
-		}
+		launchExe, _ = a.bestRootGameExe(gameDir)
 		if launchExe == "" {
 			launchExe = targetExe
 		}
@@ -986,12 +1098,12 @@ func (a *App) DetectGames() []GameInfo {
 			DetectedAPI: detectedAPI,
 		}
 		games = append(games, game)
-		runtime.EventsEmit(a.ctx, "scan:game", game)
+		a.emitEvent("scan:game", game)
 		writeLog(fmt.Sprintf("DetectGames: Found '%s' at %s (Patched: %v, API: %s)", name, path, isInstalled, detectedAPI))
 	}
 
 	updateStatus := func(msg string) {
-		runtime.EventsEmit(a.ctx, "scan:status", msg)
+		a.emitEvent("scan:status", msg)
 	}
 
 	updateStatus("Checking Epic Games Launcher manifests...")
@@ -1125,7 +1237,7 @@ func (a *App) DetectGames() []GameInfo {
 	}
 
 	updateStatus("")
-	runtime.EventsEmit(a.ctx, "scan:complete", len(games))
+	a.emitEvent("scan:complete", len(games))
 	writeLog(fmt.Sprintf("DetectGames: Sequential scan complete. Found %d games across all drives", len(games)))
 	return games
 }
@@ -1141,18 +1253,21 @@ func (a *App) checkDLSS5Installed(gamePath string) bool {
 		return false
 	}
 
-	files := []string{
-		"nvngx_dlss.dll",
-		"nvngx_dlssnr.dll",
-		"renodx-dlss5.addon64",
-	}
+	// The patcher ships two add-on files: renodx-dlss5.addon64 (the core
+	// DLSS 5 neural-renderer add-on, always deployed) and dlss5-feed.addon64
+	// (only for non-native-DLSS games). Games can legitimately ship their own
+	// nvngx_dlssnrg.dll / nvngx_dlss.dll (this game ships BOTH in its DLSS
+	// plugin dir), so those DLLs alone never indicate a patch; the add-on
+	// files are the only patcher-owned marker. renodx-dlss5.addon64 always lives
+	// beside (or near) the ReShade hook, so check any candidate dir.
 
-	for _, file := range files {
-		if _, err := os.Stat(filepath.Join(targetDir, file)); os.IsNotExist(err) {
-			return false
+	allDirs := a.findAllTargetDirs(gamePath)
+	for _, dir := range allDirs {
+		if _, err := os.Stat(filepath.Join(dir, "renodx-dlss5.addon64")); err == nil {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // detectGameAPI detects the rendering API used by a game executable via fast PE headers & 2MB buffer scan
@@ -1279,39 +1394,70 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 	}
 
 	details.IsInstalled = a.checkDLSS5Installed(rootDir)
+	// DLSS 5 files are spread across the game tree (ReShade hook dir, DLSS
+	// plugin dir, repack root,. .) depending on whetherthe game ships native
+	// DLSS. Evaluate presence across every candidate directory so the status does
+	// NOT falsely report "Incomplete" for direct/native installs that place
+	// nvngx_dlss.dll in a plugin folder rather than the shipping folder.
 
-	// Check DLSS 5 add-on status consistently
-	renodxPath := filepath.Join(targetDir, "renodx-dlss5.addon64")
-	feedPath := filepath.Join(targetDir, "dlss5-feed.addon64")
-	hasAddon := false
-	if _, err := os.Stat(renodxPath); err == nil {
-		hasAddon = true
-	} else if _, err := os.Stat(feedPath); err == nil {
-		hasAddon = true
-	}
+	allDirs := a.findAllTargetDirs(rootDir)
+	checkAddonStatus := func() string {
+		hasRenodx := false
+		hasFeed := false
+		// renodx-dlss5.addon64 is the patcher's always-deployed core add-on;
+		// dlss5-feed.addon64 accompanies it only for non-native-DLSS games.
 
-	hasDLSSDLLs := false
-	if _, err := os.Stat(filepath.Join(targetDir, "nvngx_dlss.dll")); err == nil {
-		if _, err := os.Stat(filepath.Join(targetDir, "nvngx_dlssnr.dll")); err == nil {
-			hasDLSSDLLs = true
+		// Games may ship their own nvngx_dlss.dll / nvngx_dlssnr.dll, so those do
+		// NOT prove a patch — only the add-on files do. Still report a partial
+		// install if an add-on is present without the neural renderer DLLs shortly
+		// after an interrupted patch.
+		hasNR := false
+		for _, dir := range allDirs {
+			if _, err := os.Stat(filepath.Join(dir, "renodx-dlss5.addon64")); err == nil {
+				hasRenodx = true
+			}
+			if _, err := os.Stat(filepath.Join(dir, "dlss5-feed.addon64")); err == nil {
+				hasFeed = true
+			}
+			if _, err := os.Stat(filepath.Join(dir, "nvngx_dlssnr.dll")); err == nil {
+				hasNR = true
+			}
+		}
+		switch {
+		case hasRenodx:
+			if hasNR {
+				return "Installed"
+			}
+			return "Incomplete"
+		case hasFeed:
+			if hasNR {
+				return "Installed"
+			}
+			return "Incomplete"
+		default:
+			return "Not Installed"
 		}
 	}
-
-	if hasAddon && hasDLSSDLLs {
-		details.DLSS5Addon = "Installed"
-	} else if hasAddon || hasDLSSDLLs {
-		details.DLSS5Addon = "Incomplete"
-	} else {
-		details.DLSS5Addon = "Not Installed"
-	}
+	details.DLSS5Addon = checkAddonStatus()
 
 	_, reshadeVer, reshadeAddon := getReshadeInfo(targetDir)
 	if reshadeVer != "" {
 		clean := "Installed"
-		if reshadeAddon {
-			clean = "Installed + add-on"
-		} else if details.DLSS5Addon == "Installed" || details.DLSS5Addon == "Incomplete" {
-			clean = "Installed (legacy proxy)"
+		switch {
+		case reshadeAddon && details.DLSS5Addon == "Installed":
+			clean = "Installed + DLSS 5 add-on"
+		case details.DLSS5Addon == "Installed":
+			clean = "Installed + DLSS 5 add-on"
+		case details.DLSS5Addon == "Incomplete":
+			clean = "Installed (DLSS 5 add-on incomplete)"
+		default:
+			// A ReShade build still present after uninstall is purely the game's
+			// own shipped one; don't dress it up as this patcher's work.
+			if reshadeAddon {
+				clean = "Installed (built-in add-on build)"
+			} else {
+				clean = "Installed (built-in)"
+			}
 		}
 		details.ReshadeStatus = clean + " (" + reshadeVer + ")"
 	} else if _, err := os.Stat(filepath.Join(targetDir, "ReShade.ini")); err == nil {
@@ -1422,13 +1568,29 @@ func (a *App) installBackupDLL(dir, moduleName string) error {
 	return copyFile(existing, dst)
 }
 
-// gameHasNativeDLSS reports whether the game ships its own DLSS runtime
-// (nvngx_dlss.dll / nvngx_dlssd.dll / _nvngx.dll / Streamline sl.dlss.dll).
-// Native-DLSS games use the Direct RenoDX add-on path and must NOT get the
-// DLSS5-Feeder (it would race the game's own NGX session and crash).
+// gameHasNativeDLSS reports whether the game itself drives DLSS from its ACTIVE
+// rendering folder (the resolved shipping dir / launcher root). A stray copy of
+// nvngx_dlss.dll inside a third-party plugin folder (e.g.
+// Plugins\DLSS\Binaries\ThirdParty\Win64) does NOT mean the game runs native
+// DLSS — UE4 repacks often ship such binaries unused, and the game may render
+// via D3D11 where RenoDX's D3D12-only NGX hooks never fire. Native-DLSS
+// games use the Direct RenoDX add-on path and must NOT get the DLSS5-Feeder (it
+// would race the game's own NGX session and crash), whereas non-native games NEED
+// the feed to fabricate depth/motion input for the neural renderer.
+
 func (a *App) gameHasNativeDLSS(gamePath string) bool {
+	targetDir, _, launchExe, _, err := a.resolveGameTarget(gamePath)
+	if err != nil || targetDir == "" {
+		return false
+	}
+	dirs := []string{targetDir}
+	if launchExe != "" {
+		launchDir := filepath.Dir(launchExe)
+		if launchDir != targetDir {
+			dirs = append(dirs, launchDir)
+		}
+	}
 	markers := []string{"nvngx_dlss.dll", "_nvngx.dll", "sl.dlss.dll", "nvngx_dlssd.dll", "nvngx_dlssg.dll"}
-	dirs := a.findAllTargetDirs(gamePath)
 	for _, dir := range dirs {
 		for _, m := range markers {
 			if p, err := os.Stat(filepath.Join(dir, m)); err == nil && !p.IsDir() {
@@ -1437,6 +1599,14 @@ func (a *App) gameHasNativeDLSS(gamePath string) bool {
 		}
 	}
 	return false
+}
+
+// nativeModeLabel returns a human-readable description of the install mode.
+func nativeModeLabel(native bool) string {
+	if native {
+		return "Direct (no feeder)"
+	}
+	return "Federated (feed + renodx)"
 }
 
 // InstallReshade installs ReShade to the target game folder using command line or manual fallback
@@ -1494,7 +1664,7 @@ func (a *App) InstallReshade(gamePath string) PatchResult {
 			case "opengl":
 				moduleName = "opengl32.dll"
 			}
-a.copyReshadeFilesManually(targetDir, api, native)
+			a.copyReshadeFilesManually(targetDir, api, native)
 			_ = a.installBackupDLL(targetDir, moduleName)
 		}
 
@@ -1767,6 +1937,7 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 	// (feed + renodx) for games without DLSS, Direct (renodx only) for games
 	// that ship nvngx_dlss.dll so we do not race their NGX session.
 	native := a.gameHasNativeDLSS(gamePath)
+	writeLog(fmt.Sprintf("InstallDLSS5: native DLSS runtime in active dir: %v (mode: %s)", native, nativeModeLabel(native)))
 
 	// The DLSS 5 feed add-on must accompany the RenoDX add-on so the neural
 	// renderer's guides are produced by ReShade for 64-bit D3D12 games too.
@@ -2118,6 +2289,19 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 		"renodx-dlss5.addon32",
 	}
 
+	// The DLSS 5 add-on / feed files are placed by this patcher and never
+	// ship with a game, so they are ALWAYS patcher-owned and must be purged on
+	// uninstall even from folders whose backup marker is empty (the patcher
+	// spreads add-ons to hook dirs without backing them tip there).
+	addonFilesOwned := []string{
+		"dlss5-feed.addon64",
+		"dlss5-feed.addon32",
+		"dlss5-feed.cfg",
+		"dlss5-feed.log",
+		"renodx-dlss5.addon64",
+		"renodx-dlss5.addon32",
+	}
+
 	foldersToRemove := []string{
 		"reshade-shaders",
 		"ReShade",
@@ -2209,6 +2393,19 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 						}
 					}
 				}
+			}
+		}
+
+		// Add-on files are patcher-owned, never shipped by games — purge them
+		// unconditionally in every target dir regardless of backup protection.
+		for _, addon := range addonFilesOwned {
+			addonPath := filepath.Join(dir, addon)
+			if _, err := os.Stat(addonPath); err != nil {
+				continue
+			}
+			writeLog(fmt.Sprintf("UninstallPatch: Removing patcher add-on %s", addonPath))
+			if err := cleanDLL(addonPath); err != nil {
+				writeLog(fmt.Sprintf("UninstallPatch: Failed to remove add-on %s: %v", addonPath, err))
 			}
 		}
 
