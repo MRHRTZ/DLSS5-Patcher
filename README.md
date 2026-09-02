@@ -30,10 +30,11 @@ The binary is generated at `src/build/bin/DLSS 5 Patcher.exe`. Copy it to the wo
 ```
 DLSS 5 Setup/
 ├── DLSS 5 Patcher.exe         # Production launcher
+├── ReShadeConfig.json         # Optional ReShade installer URL
 ├── ReShade/                   # ReShade dependencies
 │   ├── Effects/               # ReShade shaders & textures
 │   ├── Extracted/             # Pre-extracted ReShade64.dll & manifests
-│   └── ReShade_Setup_6.8.0_Addon.exe
+│   └── ReShade_Setup_6.8.0.exe  # Auto-downloaded if missing
 ├── data/                      # DLSS 5 neural rendering addons & DLLs
 │   ├── dlss5-feed.addon64
 │   ├── renodx-dlss5.addon64
@@ -43,6 +44,18 @@ DLSS 5 Setup/
 ├── patcher.log                # Operation log
 └── src/                       # Wails application source
 ```
+
+## ReShade Installer Size
+
+The official ReShade installer (`ReShade_Setup_6.8.0.exe`, ~4 MB) is **not** bundled with the repo to keep downloads small. Configure its download URL in `ReShadeConfig.json`:
+
+```json
+{
+  "url": ""
+}
+```
+
+If `url` is empty, the app downloads from `https://reshade.me/downloads/ReShade_Setup_6.8.0.exe`. The installer is cached in `ReShade/` for future patches, then `ReShade64.dll` is extracted into `ReShade/Extracted/`.
 
 ## Download
 [Download DLSS 5 Patcher](https://release)

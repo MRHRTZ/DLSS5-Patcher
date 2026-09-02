@@ -5,6 +5,9 @@ import (
 	"context"
 	"debug/pe"
 	"fmt"
+	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -87,6 +90,81 @@ func getAssetPath(subPath string) string {
 		}
 	}
 	return subPath
+}
+
+const (
+	reshadeConfigFile = "ReShadeConfig.json"
+	defaultReShadeURL = "https://reshade.me/downloads/ReShade_Setup_6.8.0.exe"
+	defaultReShadeExe = "ReShade_Setup_6.8.0.exe"
+)
+
+type reshadeConfig struct {
+	URL string `json:"url"`
+}
+
+// getReShadeSetup resolves the ReShade setup executable path, checking a
+// config file first, then well-known local installs, then the bundled Addon
+// build as a last resort. If none exists, it will be downloaded on demand.
+func getReShadeSetup() (string, error) {
+	candidates := []string{
+		// 1. User-configured path
+		getAssetPath(reshadeConfigFile),
+		getAssetPath(filepath.Join("ReShade", reshadeConfigFile)),
+		getAssetPath(filepath.Join("ReShade", "ReShade_Setup_6.8.0_Addon.exe")),
+		getAssetPath(filepath.Join("ReShade", defaultReShadeExe)),
+	}
+
+	configuredURL := ""
+	if cfg, err := os.ReadFile(candidates[0]); err == nil {
+		var config reshadeConfig
+		if err := json.Unmarshal(cfg, &config); err != nil {
+			writeLog("getReShadeSetup: invalid JSON config: " + err.Error())
+		} else {
+			configuredURL = strings.TrimSpace(config.URL)
+		}
+	}
+	for _, c := range candidates[1:] {
+		if _, err := os.Stat(c); err == nil {
+			return c, nil
+		}
+	}
+
+	downloadURL := defaultReShadeURL
+	if configuredURL != "" {
+		downloadURL = configuredURL
+	}
+	writeLog("getReShadeSetup: No ReShade installer found locally, downloading from " + downloadURL)
+	dest := getAssetPath(filepath.Join("ReShade", defaultReShadeExe))
+	if err := downloadFile(downloadURL, dest); err != nil {
+		return "", fmt.Errorf("failed to download ReShade installer: %v", err)
+	}
+	return dest, nil
+}
+
+// downloadFile downloads url into dest with a simple progress log.
+func downloadFile(url, dest string) error {
+	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+		return err
+	}
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+	}
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	writeLog(fmt.Sprintf("downloadFile: downloading %s -> %s", url, dest))
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return err
+	}
+	writeLog("downloadFile: download complete: " + dest)
+	return nil
 }
 
 // Windows Version API procedures for reading DLL file version
@@ -1390,7 +1468,7 @@ func (a *App) InstallReshade(gamePath string) PatchResult {
 	}
 	native := a.gameHasNativeDLSS(gamePath)
 
-	reshadeSetup := getAssetPath(filepath.Join("ReShade", "ReShade_Setup_6.8.0_Addon.exe"))
+	reshadeSetup, setupErr := getReShadeSetup()
 	writeLog("InstallReshade: ReShade setup path: " + reshadeSetup)
 	writeLog(fmt.Sprintf("InstallReshade: Target EXE: %s in Directory: %s with API: %s", targetExe, targetDir, api))
 
@@ -1422,6 +1500,11 @@ a.copyReshadeFilesManually(targetDir, api, native)
 
 		writeLog("InstallReshade: ReShade already present with add-on support, configuration updated for " + targetDir)
 		return PatchResult{Success: true, Message: "ReShade already installed (add-on build found); configuration updated"}
+	}
+
+	if setupErr != nil {
+		writeLog("InstallReshade: ERROR resolving ReShade setup: " + setupErr.Error())
+		return a.copyReshadeFilesManually(targetDir, api, native)
 	}
 
 	if _, err := os.Stat(reshadeSetup); os.IsNotExist(err) {
@@ -1597,7 +1680,7 @@ func (a *App) copyReshadeFilesManually(targetDir string, api string, native bool
 
 	extractedDLL := getAssetPath(filepath.Join("ReShade", "Extracted", "ReShade64.dll"))
 	if _, err := os.Stat(extractedDLL); err != nil {
-		reshadeSetup := getAssetPath(filepath.Join("ReShade", "ReShade_Setup_6.8.0_Addon.exe"))
+		reshadeSetup, _ := getReShadeSetup()
 		if _, statErr := os.Stat(reshadeSetup); statErr == nil {
 			extractReshadeDLL(reshadeSetup, filepath.Dir(extractedDLL))
 		}
@@ -2058,7 +2141,7 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 		}
 	}
 
-	reshadeSetup := getAssetPath(filepath.Join("ReShade", "ReShade_Setup_6.8.0_Addon.exe"))
+	reshadeSetup, _ := getReShadeSetup()
 	var errors []string
 
 	for _, dir := range targetDirs {
