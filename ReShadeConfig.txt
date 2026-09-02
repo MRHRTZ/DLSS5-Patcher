@@ -1,5 +1,0 @@
-# ReShade installer path override.
-# Leave empty to auto-download ReShade_Setup_6.8.0.exe from reshade.me when missing.
-#
-# Example:
-# C:\Tools\ReShade_Setup_6.8.0.exe
