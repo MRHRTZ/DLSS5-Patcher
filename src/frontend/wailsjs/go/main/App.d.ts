@@ -10,6 +10,8 @@ export function DetectGames():Promise<Array<main.GameInfo>>;
 
 export function GetAppVersion():Promise<string>;
 
+export function GetGPUs():Promise<Array<main.GpuInfo>>;
+
 export function GetGameDetails(arg1:string):Promise<main.GameDetails>;
 
 export function GetGameFolderPreview(arg1:string):Promise<main.GameInfo>;
@@ -20,6 +22,8 @@ export function Greet(arg1:string):Promise<string>;
 
 export function InstallDLSS5(arg1:string):Promise<main.PatchResult>;
 
+export function InstallOptiScaler(arg1:string):Promise<main.PatchResult>;
+
 export function InstallReshade(arg1:string):Promise<main.PatchResult>;
 
 export function KillGameProcess(arg1:string):Promise<string>;
@@ -27,5 +31,11 @@ export function KillGameProcess(arg1:string):Promise<string>;
 export function LaunchGame(arg1:string):Promise<main.PatchResult>;
 
 export function PatchGame(arg1:string):Promise<main.PatchResult>;
+
+export function PatchGameWithMode(arg1:string,arg2:string):Promise<main.PatchResult>;
+
+export function RefreshGPUs():Promise<Array<main.GpuInfo>>;
+
+export function SelectGPU(arg1:string):Promise<main.GpuInfo>;
 
 export function UninstallPatch(arg1:string):Promise<main.PatchResult>;

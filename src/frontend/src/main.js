@@ -1,12 +1,24 @@
 import './style.css';
 import './app.css';
-import { DetectGames, BrowseExe, GetGameFolderPreview, GetGameDetails, PatchGame, LaunchGame, GetAppVersion, UninstallPatch, KillGameProcess } from '../wailsjs/go/main/App';
+import { DetectGames, BrowseExe, GetGameFolderPreview, GetGameDetails, PatchGameWithMode, LaunchGame, GetAppVersion, UninstallPatch, KillGameProcess, GetGPUs, SelectGPU, RefreshGPUs } from '../wailsjs/go/main/App';
 import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime';
 
 document.querySelector('#app').innerHTML = `
   <div class="container">
     <header class="header">
       <h1>DLSS 5 Patcher</h1>
+      <div class="gpu-preview" id="gpuPreview">
+        <span class="gpu-preview-label">GPU:</span>
+        <select id="gpuSelect" class="gpu-select" title="Select GPU for this machine">
+          <option value="">Detecting...</option>
+        </select>
+        <span class="gpu-preview-badge" id="gpuNRBadge">NR: --</span>
+        <button id="gpuRefreshBtn" class="btn-icon gpu-refresh-btn" title="Refresh GPU detection" aria-label="Refresh GPU detection">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
+          </svg>
+        </button>
+      </div>
     </header>
 
     <main class="main">
@@ -46,8 +58,21 @@ document.querySelector('#app').innerHTML = `
 
       <section class="action-section">
         <div id="patchSection" style="display: none;">
-          <button id="patchBtn" class="btn btn-primary btn-large">Patch Game (Install ReShade + DLSS 5)</button>
-          <button id="uninstallBtn" class="btn btn-danger btn-large" style="display: none;">Uninstall Patch (Remove ReShade + DLSS 5)</button>
+          <div class="patch-mode-toggle">
+            <label class="mode-label">Patch Method:</label>
+            <div class="mode-options">
+              <button id="modeReshade" class="mode-btn mode-btn-active" data-mode="reshade">
+                <span class="mode-btn-title">ReShade + DLSS 5 Add-On</span>
+                <span class="mode-recommended" id="modeReshadeRec">Recommended</span>
+              </button>
+              <button id="modeOptiscaler" class="mode-btn" data-mode="optiscaler">
+                <span class="mode-btn-title">OptiScaler (FSR / XeSS / DLSS)</span>
+                <span class="mode-recommended" id="modeOptiscalerRec">Recommended</span>
+              </button>
+            </div>
+          </div>
+          <button id="patchBtn" class="btn btn-primary btn-large">Patch Game (Install ReShade + DLSS 5 Add-On)</button>
+          <button id="uninstallBtn" class="btn btn-danger btn-large" style="display: none;">Uninstall Patch</button>
           <div id="patchProgress" class="progress" style="display: none;">
             <div class="progress-bar" id="progressBar"></div>
           </div>
@@ -88,6 +113,9 @@ let selectedGame = null;
 let games = [];
 let isScanning = false;
 let searchQuery = '';
+let patchMode = 'reshade';
+let gpuNR = null; // true = RTX 50 neural rendering, false = not supported, null = unknown
+let modeManuallySet = false;
 
 // Normalize game object to have consistent lowercase property keys
 function normalizeGame(game) {
@@ -279,6 +307,10 @@ async function selectGame(game) {
             <span class="row-label">ReShade</span>
             <span class="row-value ${details.reshadeStatus !== 'Not Installed' ? 'status-green' : 'status-muted'}">${details.reshadeStatus || 'Not Installed'}</span>
           </div>
+          <div class="details-row">
+            <span class="row-label">OptiScaler</span>
+            <span class="row-value ${details.optiScalerStatus !== 'Not Installed' ? 'status-green' : 'status-muted'}">${details.optiScalerStatus || 'Not Installed'}</span>
+          </div>
         </div>
 
         ${details.dllList && details.dllList.length > 0 ? `
@@ -307,16 +339,15 @@ async function selectGame(game) {
   document.getElementById('patchSection').style.display = 'block';
   document.getElementById('launchSection').style.display = 'block';
 
-  const patchBtn = document.getElementById('patchBtn');
   const uninstallBtn = document.getElementById('uninstallBtn');
   
   if (selectedGame.isInstalled) {
-    patchBtn.textContent = 'Re-Patch Game (Reinstall ReShade + DLSS 5)';
     uninstallBtn.style.display = 'block';
   } else {
-    patchBtn.textContent = 'Patch Game (Install ReShade + DLSS 5)';
     uninstallBtn.style.display = 'none';
   }
+  updatePatchButton();
+  document.getElementById('previewSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 async function handleBrowseExe() {
@@ -368,7 +399,7 @@ async function handlePatch() {
   }, 200);
 
   try {
-    const result = await PatchGame(selectedGame.path);
+    const result = await PatchGameWithMode(selectedGame.path, patchMode);
     clearInterval(progressInterval);
     progressBar.style.width = '100%';
 
@@ -396,11 +427,7 @@ async function handlePatch() {
     showResult('error', 'Patch failed: ' + err);
   } finally {
     patchBtn.disabled = false;
-    if (selectedGame.isInstalled) {
-      patchBtn.textContent = 'Re-Patch Game (Reinstall ReShade + DLSS 5)';
-    } else {
-      patchBtn.textContent = 'Patch Game (Install ReShade + DLSS 5)';
-    }
+    updatePatchButton();
     setTimeout(() => {
       patchProgress.style.display = 'none';
     }, 1000);
@@ -545,7 +572,7 @@ async function handleUninstall() {
     showResult('error', 'Uninstall failed: ' + err);
   } finally {
     uninstallBtn.disabled = false;
-    uninstallBtn.textContent = 'Uninstall Patch (Remove ReShade + DLSS 5)';
+    uninstallBtn.textContent = 'Uninstall Patch';
     setTimeout(() => {
       patchProgress.style.display = 'none';
     }, 1000);
@@ -631,6 +658,143 @@ async function loadVersion() {
   }
 }
 
+async function loadGpuInfo() {
+  try {
+    const gpus = await GetGPUs();
+    renderGpuSelect(gpus);
+  } catch (err) {
+    console.error('Failed to get GPU info:', err);
+    const sel = document.getElementById('gpuSelect');
+    if (sel) {
+      sel.replaceChildren(new Option('Unknown GPU', ''));
+    }
+    updateNRBadge(document.getElementById('gpuNRBadge'), null);
+  }
+}
+
+function renderGpuSelect(gpus) {
+  const sel = document.getElementById('gpuSelect');
+  const nrBadgeElem = document.getElementById('gpuNRBadge');
+  const preview = document.getElementById('gpuPreview');
+
+  if (!sel) return;
+
+  const options = gpus.map(g => {
+    const opt = document.createElement('option');
+    opt.value = g.name || '';
+    let label = g.name || 'Unknown GPU';
+    if (g.vendor) label = g.vendor + ' | ' + label;
+    opt.textContent = label;
+    if (g.selected || g.active) opt.textContent += ' (active)';
+    return opt;
+  });
+
+  if (options.length === 0) {
+    options.push(new Option('Unknown GPU', ''));
+  }
+  sel.replaceChildren(...options);
+
+  const active = gpus.find(g => g.active) || gpus.find(g => g.selected) || gpus[0];
+  if (active) {
+    sel.value = active.name || '';
+    updateNRBadge(nrBadgeElem, active);
+    gpuNR = !!(active.supportsNeuralRendering ?? active.SupportsNeuralRendering);
+  } else {
+    gpuNR = null;
+    updateNRBadge(nrBadgeElem, null);
+  }
+
+  applyRecommendedMode();
+
+  // Set default patch method from GPU NR support if the user hasn't chosen one yet.
+  // Only an RTX 50 (NR supported) defaults to ReShade; otherwise (NR No or
+  // unknown) OptiScaler is the safe cross-vendor default.
+  if (!modeManuallySet) {
+    if (gpuNR === true && patchMode !== 'reshade') {
+      setPatchMode('reshade');
+    } else if (gpuNR !== true && patchMode !== 'optiscaler') {
+      setPatchMode('optiscaler');
+    }
+  }
+
+  if (preview) preview.style.display = 'flex';
+}
+
+// applyRecommendedMode sets the (Recommended) badge based on the active GPU's
+// Neural Rendering support:
+//   - NR supported (RTX 50)  -> ReShade + DLSS 5 Add-On is recommended
+//   - NR not supported       -> OptiScaler is recommended
+//   - unknown                -> OptiScaler is recommended (cross-vendor safe)
+function applyRecommendedMode() {
+  const reshadeRecommended = gpuNR === true; // only RTX 50 -> reshade
+  document.getElementById('modeReshadeRec').style.display = reshadeRecommended ? 'inline-flex' : 'none';
+  document.getElementById('modeOptiscalerRec').style.display = reshadeRecommended ? 'none' : 'inline-flex';
+}
+
+function updateNRBadge(elem, gpu) {
+  if (!elem) return;
+  elem.classList.remove('badge-yes', 'badge-no', 'badge-unknown');
+  if (!gpu) {
+    elem.textContent = 'NR: --';
+    elem.classList.add('badge-unknown');
+    return;
+  }
+  const nr = !!(gpu.supportsNeuralRendering ?? gpu.SupportsNeuralRendering);
+  if (nr) {
+    elem.textContent = 'NR: Yes';
+    elem.classList.add('badge-yes');
+  } else {
+    elem.textContent = 'NR: No';
+    elem.classList.add('badge-no');
+  }
+}
+
+function setupGpuControls() {
+  const sel = document.getElementById('gpuSelect');
+  const refreshBtn = document.getElementById('gpuRefreshBtn');
+
+  if (sel) {
+    sel.addEventListener('change', async () => {
+      const name = sel.value;
+      try {
+        const active = await SelectGPU(name);
+        if (active) {
+          refreshGpuBadge();
+        }
+      } catch (err) {
+        console.error('Failed to select GPU:', err);
+      }
+    });
+  }
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', async () => {
+      refreshBtn.disabled = true;
+      refreshBtn.classList.add('spinning');
+      const sel2 = document.getElementById('gpuSelect');
+      if (sel2) sel2.replaceChildren(new Option('Detecting...', ''));
+      try {
+        const fresh = await RefreshGPUs();
+        renderGpuSelect(fresh);
+      } finally {
+        refreshBtn.disabled = false;
+        refreshBtn.classList.remove('spinning');
+      }
+    });
+  }
+}
+
+async function refreshGpuBadge() {
+  try {
+    const gpus = await GetGPUs();
+    const active = gpus.find(g => g.active) || gpus[0] || null;
+    updateNRBadge(document.getElementById('gpuNRBadge'), active);
+    const sel = document.getElementById('gpuSelect');
+    if (active && sel) sel.value = active.name || '';
+  } catch (err) {
+    console.error('Failed to refresh GPU badge:', err);
+  }
+}
+
 // Event listeners
 async function handleRefresh() {
   const refreshBtn = document.getElementById('refreshBtn');
@@ -650,6 +814,38 @@ document.getElementById('browseBtn').addEventListener('click', handleBrowseExe);
 document.getElementById('patchBtn').addEventListener('click', handlePatch);
 document.getElementById('uninstallBtn').addEventListener('click', handleUninstall);
 document.getElementById('launchBtn').addEventListener('click', handleLaunch);
+
+// Mode toggle handlers
+document.getElementById('modeReshade')?.addEventListener('click', () => {
+  modeManuallySet = true;
+  setPatchMode('reshade');
+});
+document.getElementById('modeOptiscaler')?.addEventListener('click', () => {
+  modeManuallySet = true;
+  setPatchMode('optiscaler');
+});
+
+function setPatchMode(mode) {
+  patchMode = mode;
+  document.getElementById('modeReshade').classList.toggle('mode-btn-active', mode === 'reshade');
+  document.getElementById('modeOptiscaler').classList.toggle('mode-btn-active', mode === 'optiscaler');
+  updatePatchButton();
+}
+
+function updatePatchButton() {
+  const patchBtn = document.getElementById('patchBtn');
+  const uninstallBtn = document.getElementById('uninstallBtn');
+  if (patchMode === 'optiscaler') {
+    patchBtn.textContent = selectedGame?.isInstalled
+      ? 'Re-Patch Game — OptiScaler (FSR / XeSS / DLSS)'
+      : 'Patch Game — Install OptiScaler (FSR / XeSS / DLSS)';
+  } else {
+    patchBtn.textContent = selectedGame?.isInstalled
+      ? 'Re-Patch Game — ReShade + DLSS 5 Add-On'
+      : 'Patch Game — Install ReShade + DLSS 5 Add-On';
+  }
+  uninstallBtn.textContent = 'Uninstall Patch';
+}
 document.getElementById('discordBtn').addEventListener('click', (e) => {
   e.preventDefault();
   BrowserOpenURL('https://discord.gg/DZRMwdnYs');
@@ -669,3 +865,5 @@ document.addEventListener('click', (e) => {
 // Initialize
 loadGames();
 loadVersion();
+loadGpuInfo();
+setupGpuControls();

@@ -24,6 +24,7 @@ export namespace main {
 	    dlssVersion: string;
 	    dlss5Addon: string;
 	    reshadeStatus: string;
+	    optiScalerStatus: string;
 	    isInstalled: boolean;
 	    dllList: DLLDetail[];
 	
@@ -40,6 +41,7 @@ export namespace main {
 	        this.dlssVersion = source["dlssVersion"];
 	        this.dlss5Addon = source["dlss5Addon"];
 	        this.reshadeStatus = source["reshadeStatus"];
+	        this.optiScalerStatus = source["optiScalerStatus"];
 	        this.isInstalled = source["isInstalled"];
 	        this.dllList = this.convertValues(source["dllList"], DLLDetail);
 	    }
@@ -80,6 +82,28 @@ export namespace main {
 	        this.exePath = source["exePath"];
 	        this.isInstalled = source["isInstalled"];
 	        this.detectedAPI = source["detectedAPI"];
+	    }
+	}
+	export class GpuInfo {
+	    name: string;
+	    supportsNeuralRendering: boolean;
+	    vendor: string;
+	    vram: number;
+	    selected: boolean;
+	    active: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new GpuInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.supportsNeuralRendering = source["supportsNeuralRendering"];
+	        this.vendor = source["vendor"];
+	        this.vram = source["vram"];
+	        this.selected = source["selected"];
+	        this.active = source["active"];
 	    }
 	}
 	export class PatchResult {

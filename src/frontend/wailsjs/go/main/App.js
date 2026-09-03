@@ -18,6 +18,10 @@ export function GetAppVersion() {
   return window['go']['main']['App']['GetAppVersion']();
 }
 
+export function GetGPUs() {
+  return window['go']['main']['App']['GetGPUs']();
+}
+
 export function GetGameDetails(arg1) {
   return window['go']['main']['App']['GetGameDetails'](arg1);
 }
@@ -38,6 +42,10 @@ export function InstallDLSS5(arg1) {
   return window['go']['main']['App']['InstallDLSS5'](arg1);
 }
 
+export function InstallOptiScaler(arg1) {
+  return window['go']['main']['App']['InstallOptiScaler'](arg1);
+}
+
 export function InstallReshade(arg1) {
   return window['go']['main']['App']['InstallReshade'](arg1);
 }
@@ -52,6 +60,18 @@ export function LaunchGame(arg1) {
 
 export function PatchGame(arg1) {
   return window['go']['main']['App']['PatchGame'](arg1);
+}
+
+export function PatchGameWithMode(arg1, arg2) {
+  return window['go']['main']['App']['PatchGameWithMode'](arg1, arg2);
+}
+
+export function RefreshGPUs() {
+  return window['go']['main']['App']['RefreshGPUs']();
+}
+
+export function SelectGPU(arg1) {
+  return window['go']['main']['App']['SelectGPU'](arg1);
 }
 
 export function UninstallPatch(arg1) {

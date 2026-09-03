@@ -23,6 +23,382 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
+// --- DXGI GPU Detection via COM syscall ---
+
+var (
+	moddxgi  = syscall.NewLazyDLL("dxgi.dll")
+	modole32 = syscall.NewLazyDLL("ole32.dll")
+
+	procCreateDXGIFactory1 = moddxgi.NewProc("CreateDXGIFactory1")
+	procCoInitializeEx    = modole32.NewProc("CoInitializeEx")
+	procCoUninitialize    = modole32.NewProc("CoUninitialize")
+)
+
+// {770AAE78-F26F-4DBA-A829-253C83D1B387} — IDXGIFactory1
+var IID_IDXGIFactory1 = [16]byte{0x78, 0xae, 0x7a, 0x77, 0x6f, 0xf2, 0xba, 0x4d, 0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}
+
+// dxgiAdapterDesc1 mirrors the native DXGI_ADAPTER_DESC1 structure.
+// Field order MUST match the Windows SDK definition exactly.
+type dxgiAdapterDesc1 struct {
+	Description            [128]uint16 // WCHAR[128] — comes first
+	VendorID               uint32
+	DeviceID               uint32
+	SubSysID               uint32
+	Revision               uint32
+	DedicatedVideoMemory   uintptr // SIZE_T
+	DedicatedSystemMemory  uintptr // SIZE_T — was missing
+	SharedSystemMemory     uintptr // SIZE_T
+	AdapterLuid            struct{ LowPart uint32; HighPart int32 }
+	Flags                  uint32
+}
+
+// vtableCall retrieves a COM vtable entry by index and calls it via syscall.SyscallN.
+// objPtr is the pointer to the COM object (which points to its vtable pointer).
+// idx is the vtable slot index (0-based, starting from IUnknown::QueryInterface).
+func vtableCall(objPtr uintptr, idx int, args ...uintptr) (uintptr, uintptr, error) {
+	vtbl := *(*uintptr)(unsafe.Pointer(objPtr))
+	procAddr := *(*uintptr)(unsafe.Pointer(vtbl + uintptr(idx)*unsafe.Sizeof(uintptr(0))))
+	r1, r2, err := syscall.SyscallN(procAddr, append([]uintptr{objPtr}, args...)...)
+	return r1, r2, err
+}
+
+// vtableRelease calls IUnknown::Release (vtable index 2).
+func vtableRelease(objPtr uintptr) {
+	vtableCall(objPtr, 2)
+}
+
+// gpuInfo holds detected GPU metadata.
+type gpuInfo struct {
+	Name                   string
+	SupportsNeuralRendering bool  // true only for RTX 50 (Blackwell) series
+	Vendor                  string // "NVIDIA", "AMD", "Intel", "Virtual", ""
+	VRAM                    uint64 // dedicated video memory in bytes
+}
+
+// isVirtualAdapter reports whether a GPU name belongs to a virtual or remote
+// display adapter (Parsec, StarDesk, RDP, Remote Display, etc.) that should
+// not be treated as the real renderer.
+func isVirtualAdapter(name string) bool {
+	lower := strings.ToLower(name)
+	virtualKeywords := []string{
+		"parsec", "stardesk", "stardock", "remote display", "remote desktop",
+		"virtual display", "virtual adapter", "rdp", "mirror driver",
+		"idd", "indirect display", "basic display", "virtualbox",
+		"vmware", "hyper-v", "hyperv", "mirage", "nuvoton", "displaylink",
+	}
+	for _, kw := range virtualKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectGPUs enumerates every real (non-virtual) display adapter via DXGI,
+// falling back to the registry display-adapter class.  It returns the GPUs the
+// machine actually uses for rendering (NVIDIA / AMD / Intel) plus any virtual
+// adapters at the end, so callers can offer a selection.
+var (
+	gpuCacheOnce bool
+	gpuCacheList []gpuInfo
+)
+
+func refreshGPUCache() {
+	gpuCacheOnce = false
+	gpuCacheList = nil
+}
+
+func detectGPUs() []gpuInfo {
+	if gpuCacheOnce {
+		return gpuCacheList
+	}
+	gpuCacheOnce = true
+	gpuCacheList = detectGPUsUncached()
+	return gpuCacheList
+}
+
+func detectGPUsUncached() []gpuInfo {
+	var real []gpuInfo
+	var virtual []gpuInfo
+
+	// Initialize COM as MTA.
+	var mta uintptr // COINIT_MULTITHREADED = 0x2
+	procCoInitializeEx.Call(0, uintptr(unsafe.Pointer(&mta)), 0x2)
+	defer procCoUninitialize.Call()
+
+	// CreateIDXGIFactory1.
+	var factoryPtr uintptr
+	ret, _, _ := procCreateDXGIFactory1.Call(
+		uintptr(unsafe.Pointer(&IID_IDXGIFactory1)),
+		uintptr(unsafe.Pointer(&factoryPtr)),
+	)
+	if ret == 0 && factoryPtr != 0 {
+		adapterIdx := uint32(0)
+		for {
+			var adapterPtr uintptr
+			// IDXGIFactory1::EnumAdapters1 = vtable index 12
+			ret, _, _ = vtableCall(factoryPtr, 12, uintptr(adapterIdx), uintptr(unsafe.Pointer(&adapterPtr)))
+			if ret != 0 || adapterPtr == 0 {
+				break
+			}
+
+			// IDXGIAdapter1::GetDesc1 = vtable index 10
+			var desc dxgiAdapterDesc1
+			rev, _, _ := vtableCall(adapterPtr, 10, uintptr(unsafe.Pointer(&desc)))
+			if rev == 0 {
+				name := strings.TrimRight(syscall.UTF16ToString(desc.Description[:]), "\x00")
+				vendor := gpuVendor(desc.VendorID, name)
+				info := gpuInfo{
+					Name:                   name,
+					SupportsNeuralRendering: strings.Contains(name, "RTX 50"),
+					Vendor:                 vendor,
+					VRAM:                   uint64(desc.DedicatedVideoMemory),
+				}
+				if isVirtualAdapter(name) || vendor == "Virtual" {
+					virtual = append(virtual, info)
+				} else {
+					real = append(real, info)
+				}
+			}
+
+			vtableRelease(adapterPtr)
+			adapterIdx++
+		}
+		vtableRelease(factoryPtr)
+		writeLog(fmt.Sprintf("detectGPUs: DXGI enumerated %d real + %d virtual adapters", len(real), len(virtual)))
+	} else {
+		writeLog("detectGPU: CreateDXGIFactory1 failed (" + fmt.Sprintf("%x", ret) + ") — falling back to registry detection")
+	}
+
+	// If DXGI failed or returned nothing usable, fall back to the registry.
+	if len(real) == 0 {
+		regReal, regVirtual := detectGPUsFromRegistry()
+		real = append(real, regReal...)
+		virtual = append(virtual, regVirtual...)
+	}
+
+	// De-duplicate by (name, vendor) — DXGI and registry may both add entries.
+	seen := map[string]bool{}
+	var dedup []gpuInfo
+	for _, g := range append(real, virtual...) {
+		key := strings.ToLower(g.Name + "|" + g.Vendor)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		dedup = append(dedup, g)
+	}
+
+	return dedup
+}
+
+// detectGPUsFromRegistry reads the display adapter class from the registry.
+func detectGPUsFromRegistry() (real, virtual []gpuInfo) {
+	const adapterClass = `SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}`
+	for i := 0; i < 16; i++ {
+		keyPath := fmt.Sprintf(`%s\%04d`, adapterClass, i)
+		k, err := registry.OpenKey(registry.LOCAL_MACHINE, keyPath, registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		desc, _, err := k.GetStringValue("DriverDesc")
+		if err != nil || desc == "" {
+			_ = k.Close()
+			continue
+		}
+		// Prefer the more descriptive adapter name if present.
+		if adapterStr, _, err2 := k.GetStringValue("HardwareInformation.AdapterString"); err2 == nil && adapterStr != "" {
+			desc = adapterStr
+		}
+		_ = k.Close()
+
+		vendor := gpuVendor(0, desc)
+		info := gpuInfo{
+			Name:                   desc,
+			SupportsNeuralRendering: strings.Contains(desc, "RTX 50"),
+			Vendor:                 vendor,
+		}
+		if isVirtualAdapter(desc) || vendor == "Virtual" {
+			virtual = append(virtual, info)
+		} else {
+			real = append(real, info)
+		}
+	}
+	return real, virtual
+}
+
+// gpuVendor maps a PCI vendor id (and, as a secondary heuristic, the name) to
+// a friendly vendor string.
+func gpuVendor(vendorID uint32, name string) string {
+	switch vendorID {
+	case 0x10DE:
+		return "NVIDIA"
+	case 0x1002:
+		return "AMD"
+	case 0x8086:
+		return "Intel"
+	case 0x1414:
+		return "Virtual" // Microsoft Basic/RDP/Remote adapters
+	}
+	lower := strings.ToLower(name)
+	switch {
+	case strings.Contains(lower, "nvidia"):
+		return "NVIDIA"
+	case strings.Contains(lower, "amd") || strings.Contains(lower, "radeon"):
+		return "AMD"
+	case strings.Contains(lower, "intel"):
+		return "Intel"
+	case strings.Contains(lower, "parsec") || strings.Contains(lower, "stardesk") ||
+		strings.Contains(lower, "remote display") || strings.Contains(lower, "virtual"):
+		return "Virtual"
+	}
+	return ""
+}
+
+// pickPreferredGPU chooses the GPU that should be active for DLSS / NN by
+// default.  Order of preference: NVIDIA (any) with most VRAM, then any other
+// real GPU (AMD/Intel) with most VRAM, then virtual adapters.
+func pickPreferredGPU(real, virtual []gpuInfo) gpuInfo {
+	active := append(append([]gpuInfo{}, real...), virtual...)
+	if len(active) == 0 {
+		return gpuInfo{Name: "Unknown", Vendor: "", SupportsNeuralRendering: false}
+	}
+
+	// Prefer NVIDIA discrete (real) first, then any real, then virtual.
+	score := func(g gpuInfo) (prio int, vram uint64) {
+		prio = 3 // virtual
+		switch g.Vendor {
+		case "NVIDIA":
+			prio = 0
+		case "AMD", "Intel":
+			prio = 1
+		case "":
+			prio = 2
+		}
+		return prio, g.VRAM
+	}
+
+	best := active[0]
+	bestPrio, bestVRAM := score(best)
+	for _, g := range active[1:] {
+		p, v := score(g)
+		if p < bestPrio || (p == bestPrio && v > bestVRAM) {
+			best, bestPrio, bestVRAM = g, p, v
+		}
+	}
+	return best
+}
+
+// detectGPU returns the preferred GPU (the one the app should consider active).
+// It consults the persisted user selection first, then auto-detects.
+func detectGPU() gpuInfo {
+	all := detectGPUs()
+	var real, virtual []gpuInfo
+	for _, g := range all {
+		if g.Vendor == "Virtual" {
+			virtual = append(virtual, g)
+		} else {
+			real = append(real, g)
+		}
+	}
+
+	// If the user explicitly selected a GPU, honour it.
+	if sel := selectedGPUName(); sel != "" {
+		for _, g := range all {
+			if equalGPUName(g.Name, sel) {
+				return g
+			}
+		}
+	}
+
+	return pickPreferredGPU(real, virtual)
+}
+
+func equalGPUName(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+const gpuSelectionFile = "gpu_selection.json"
+
+// selectedGPUName reads the user's persisted GPU selection, if any.
+func selectedGPUName() string {
+	p := getAssetPath(gpuSelectionFile)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	var sel struct {
+		GPU string `json:"gpu"`
+	}
+	if err := json.Unmarshal(data, &sel); err != nil {
+		return ""
+	}
+	return sel.GPU
+}
+
+// saveGPUSelection persists the user's chosen GPU name.
+func saveGPUSelection(name string) error {
+	p := getAssetPath(gpuSelectionFile)
+	data, _ := json.Marshal(map[string]string{"gpu": name})
+	return os.WriteFile(p, data, 0644)
+}
+
+// GpuInfo is the serializable GPU model returned to the frontend.
+type GpuInfo struct {
+	Name                   string `json:"name"`
+	SupportsNeuralRendering bool   `json:"supportsNeuralRendering"`
+	Vendor                 string `json:"vendor"`
+	VRAM                   uint64 `json:"vram"`
+	Selected               bool   `json:"selected"`
+	Active                 bool   `json:"active"`
+}
+
+func gpuToInfo(g gpuInfo, selected string, activeName string) GpuInfo {
+	return GpuInfo{
+		Name:                   g.Name,
+		SupportsNeuralRendering: g.SupportsNeuralRendering,
+		Vendor:                 g.Vendor,
+		VRAM:                   g.VRAM,
+		Selected:               selected != "" && equalGPUName(g.Name, selected),
+		Active:                 equalGPUName(g.Name, activeName),
+	}
+}
+
+// GetGPUs returns every detected GPU and marks the currently active/selected one.
+func (a *App) GetGPUs() []GpuInfo {
+	all := detectGPUs()
+	selected := selectedGPUName()
+	active := detectGPU().Name
+	infos := make([]GpuInfo, 0, len(all))
+	for _, g := range all {
+		infos = append(infos, gpuToInfo(g, selected, active))
+	}
+	return infos
+}
+
+// SelectGPU persists the user's chosen GPU by name and returns the active GPU
+// after applying the selection.
+func (a *App) SelectGPU(name string) GpuInfo {
+	if name != "" {
+		_ = saveGPUSelection(name)
+		writeLog("SelectGPU: user selected GPU '" + name + "'")
+	} else {
+		// Clearing selection = re-enable auto detection.
+		_ = saveGPUSelection("")
+		writeLog("SelectGPU: GPU selection cleared — auto detection re-enabled")
+	}
+	active := detectGPU()
+	return gpuToInfo(active, name, active.Name)
+}
+
+// RefreshGPUs re-enumerates the GPU list from scratch (bypassing the cache) and
+// returns the freshly detected GPUs, preserving the current selection.
+func (a *App) RefreshGPUs() []GpuInfo {
+	refreshGPUCache()
+	writeLog("RefreshGPUs: GPU cache cleared — re-detecting adapters")
+	return a.GetGPUs()
+}
+
 var logFile *os.File
 
 // initLogger initializes the log file
@@ -431,15 +807,16 @@ type DLLDetail struct {
 
 // GameDetails represents full status, version details, and DLL lists for UI
 type GameDetails struct {
-	Name          string      `json:"name"`
-	Path          string      `json:"path"`
-	Executable    string      `json:"executable"`
-	RenderingAPI  string      `json:"renderingAPI"`
-	DLSSVersion   string      `json:"dlssVersion"`
-	DLSS5Addon    string      `json:"dlss5Addon"`
-	ReshadeStatus string      `json:"reshadeStatus"`
-	IsInstalled   bool        `json:"isInstalled"`
-	DLLList       []DLLDetail `json:"dllList"`
+	Name              string      `json:"name"`
+	Path              string      `json:"path"`
+	Executable        string      `json:"executable"`
+	RenderingAPI      string      `json:"renderingAPI"`
+	DLSSVersion       string      `json:"dlssVersion"`
+	DLSS5Addon        string      `json:"dlss5Addon"`
+	ReshadeStatus     string      `json:"reshadeStatus"`
+	OptiScalerStatus  string      `json:"optiScalerStatus"`
+	IsInstalled       bool        `json:"isInstalled"`
+	DLLList           []DLLDetail `json:"dllList"`
 }
 
 // PatchResult represents the result of a patch operation
@@ -694,6 +1071,11 @@ func getReshadeInfo(dir string) (string, string, bool) {
 			if b, err := os.ReadFile(p); err == nil {
 				support = bytes.Contains(b, []byte("Searching for add-ons"))
 			}
+		}
+		// Only report as ReShade if the DLL actually contains ReShade code.
+		// Games may ship their own dxgi.dll / d3d12.dll that is NOT ReShade.
+		if !support {
+			continue
 		}
 		return p, ver, support
 	}
@@ -1266,6 +1648,12 @@ func (a *App) checkDLSS5Installed(gamePath string) bool {
 		if _, err := os.Stat(filepath.Join(dir, "renodx-dlss5.addon64")); err == nil {
 			return true
 		}
+		// OptiScaler uses dxgi.dll proxy + OptiScaler.ini
+		if _, err := os.Stat(filepath.Join(dir, "OptiScaler.ini")); err == nil {
+			if _, err := os.Stat(filepath.Join(dir, "dxgi.dll")); err == nil {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -1344,10 +1732,11 @@ func (a *App) detectGameAPI(exePath string) string {
 // GetGameDetails analyzes game files and returns complete component versions, API, and DLL list
 func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 	details := GameDetails{
-		DLSSVersion:   "Not Available",
-		DLSS5Addon:    "Not Installed",
-		ReshadeStatus: "Not Installed",
-		DLLList:       []DLLDetail{},
+		DLSSVersion:      "Not Available",
+		DLSS5Addon:       "Not Installed",
+		ReshadeStatus:    "Not Installed",
+		OptiScalerStatus: "Not Installed",
+		DLLList:          []DLLDetail{},
 	}
 
 	if strings.TrimSpace(gamePathOrExe) == "" {
@@ -1465,6 +1854,15 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 			details.ReshadeStatus = "Installed (+ add-on)"
 		} else {
 			details.ReshadeStatus = "Installed"
+		}
+	}
+
+	// Detect OptiScaler installation
+	if _, err := os.Stat(filepath.Join(targetDir, "OptiScaler.ini")); err == nil {
+		if _, err := os.Stat(filepath.Join(targetDir, "dxgi.dll")); err == nil {
+			details.OptiScalerStatus = "Installed"
+		} else {
+			details.OptiScalerStatus = "Installed (proxy missing)"
 		}
 	}
 
@@ -1886,7 +2284,7 @@ func extractReshadeDLL(setupPath, outputDir string) error {
 func (a *App) copyEffects(targetDir string) error {
 	writeLog("copyEffects: Copying shaders to " + targetDir)
 
-	srcShaders := getAssetPath(filepath.Join("data", "reshade-shaders-source"))
+	srcShaders := getAssetPath(filepath.Join("data", "reshade", "reshade-shaders-source"))
 	if _, err := os.Stat(srcShaders); err != nil {
 		srcShaders = getAssetPath(filepath.Join("ReShade", "Effects", "reshade-shaders"))
 	}
@@ -1930,14 +2328,26 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 		return PatchResult{Success: false, Message: err.Error()}
 	}
 
-	srcPath := getAssetPath("data")
-	writeLog("InstallDLSS5: Source path: " + srcPath + " -> Target: " + targetDir)
+	srcPath := getAssetPath(filepath.Join("data", "reshade"))
+	dlss5Path := getAssetPath(filepath.Join("data", "dlss5"))
+	writeLog("InstallDLSS5: Reshade source: " + srcPath + " | DLSS5 shared: " + dlss5Path + " -> Target: " + targetDir)
 
 	// Whether the game is native-DLSS decides the add-on set: federated
 	// (feed + renodx) for games without DLSS, Direct (renodx only) for games
 	// that ship nvngx_dlss.dll so we do not race their NGX session.
 	native := a.gameHasNativeDLSS(gamePath)
 	writeLog(fmt.Sprintf("InstallDLSS5: native DLSS runtime in active dir: %v (mode: %s)", native, nativeModeLabel(native)))
+
+	// Detect GPU to decide whether neural rendering (nvngx_dlssnr.dll) is
+	// supported.  Only RTX 50 (Blackwell) series GPUs can run DLSSNR; on
+	// older cards the NGX runtime rejects the feature with 0xBAD00001.
+	// The neural renderer DLL is ALWAYS deployed regardless — on non-RTX 50
+	// cards it is simply ignored, but it must be present for neural
+	// rendering to ever run (and when GPU detection is inconclusive).
+	gpu := detectGPU()
+	if !gpu.SupportsNeuralRendering {
+		writeLog(fmt.Sprintf("InstallDLSS5: GPU '%s' — Neural Rendering may not be supported, but nvngx_dlssnr.dll will still be deployed", gpu.Name))
+	}
 
 	// The DLSS 5 feed add-on must accompany the RenoDX add-on so the neural
 	// renderer's guides are produced by ReShade for 64-bit D3D12 games too.
@@ -1956,7 +2366,11 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 	}
 
 	for _, file := range filesToShipping {
+		// Resolve source: check reshade-specific dir first, then shared dlss5 dir
 		src := filepath.Join(srcPath, file)
+		if _, err := os.Stat(src); os.IsNotExist(err) {
+			src = filepath.Join(dlss5Path, file)
+		}
 		dst := filepath.Join(targetDir, file)
 
 		writeLog(fmt.Sprintf("InstallDLSS5: Copying %s to shipping dir %s", src, dst))
@@ -2026,7 +2440,11 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 			if !hasDLSSOrStreamline {
 				continue
 			}
+			// Resolve from reshade dir first, then shared dlss5 dir
 			src := filepath.Join(srcPath, file)
+			if _, err := os.Stat(src); os.IsNotExist(err) {
+				src = filepath.Join(dlss5Path, file)
+			}
 			dst := filepath.Join(dir, file)
 			writeLog(fmt.Sprintf("InstallDLSS5: Copying %s to target dir %s", src, dst))
 			if _, err := os.Stat(src); err == nil {
@@ -2070,9 +2488,243 @@ func (a *App) uniqueDirs(dirs []string) []string {
 	return result
 }
 
-// PatchGame performs the complete patch: ReShade + DLSS 5
+// InstallOptiScaler installs OptiScaler as a dxgi.dll proxy with auto GPU detection
+func (a *App) InstallOptiScaler(gamePath string) PatchResult {
+	writeLog("InstallOptiScaler: Starting OptiScaler installation for " + gamePath)
+
+	if strings.TrimSpace(gamePath) == "" {
+		return PatchResult{Success: false, Message: "Game path cannot be empty"}
+	}
+
+	exePath, _ := os.Executable()
+	exeDir := filepath.Dir(exePath)
+	if isSameOrChildDirectory(gamePath, exeDir) {
+		return PatchResult{Success: false, Message: "Cannot patch the patcher directory itself"}
+	}
+
+	if running, procName := a.isGameRunning(gamePath); running {
+		writeLog(fmt.Sprintf("InstallOptiScaler: BLOCKED - Game process '%s' is currently running", procName))
+		return PatchResult{
+			Success: false,
+			Message: fmt.Sprintf("Game is currently running (%s). Please close the game first and try again.", procName),
+		}
+	}
+
+	targetDir, _, _, _, err := a.resolveGameTarget(gamePath)
+	if err != nil {
+		return PatchResult{Success: false, Message: err.Error()}
+	}
+
+	srcPath := getAssetPath(filepath.Join("data", "optiscaler"))
+	dlss5Path := getAssetPath(filepath.Join("data", "dlss5"))
+	writeLog("InstallOptiScaler: OptiScaler source: " + srcPath + " | DLSS5 shared: " + dlss5Path + " -> Target: " + targetDir)
+
+	// Detect GPU for automatic configuration
+	gpu := detectGPU()
+	isNvidia := strings.Contains(strings.ToLower(gpu.Name), "nvidia")
+	isRTX50 := gpu.SupportsNeuralRendering
+	writeLog(fmt.Sprintf("InstallOptiScaler: GPU='%s' nvidia=%v rtx50=%v", gpu.Name, isNvidia, isRTX50))
+
+	// Step 1: Create OptiScaler subdirectory in target
+	optiSubDir := filepath.Join(targetDir, "OptiScaler")
+	if err := os.MkdirAll(optiSubDir, 0755); err != nil {
+		writeLog("InstallOptiScaler: ERROR - Failed to create OptiScaler dir: " + err.Error())
+		return PatchResult{Success: false, Message: "Failed to create OptiScaler directory: " + err.Error()}
+	}
+	os.MkdirAll(filepath.Join(optiSubDir, "D3D12_OptiScaler"), 0755)
+
+	// Step 2: Copy backend DLLs to OptiScaler subdirectory
+	backendFiles := []string{
+		"nvngx_dlss.dll",
+		"nvngx_dlssd.dll",
+		"nvngx_dlssg.dll",
+		"dlss-enabler-headless.dll",
+		"amd_fidelityfx_framegeneration_dx12.dll",
+		"amd_fidelityfx_upscaler_dx12.dll",
+		"amd_fidelityfx_loader_dx12.dll",
+		"amd_fidelityfx_vk.dll",
+		"libxess.dll",
+		"libxess_dx11.dll",
+		"libxess_fg.dll",
+		"libxell.dll",
+	}
+	for _, file := range backendFiles {
+		src := filepath.Join(srcPath, "OptiScaler", file)
+		dst := filepath.Join(optiSubDir, file)
+		if _, err := os.Stat(src); err == nil {
+			if err := copyFile(src, dst); err != nil {
+				writeLog(fmt.Sprintf("InstallOptiScaler: WARNING - Failed to copy %s: %v", file, err))
+			} else {
+				writeLog(fmt.Sprintf("InstallOptiScaler: Copied %s to %s", file, optiSubDir))
+			}
+		}
+	}
+
+	// Copy D3D12Core.dll
+	d3d12Src := filepath.Join(srcPath, "OptiScaler", "D3D12_OptiScaler", "D3D12Core.dll")
+	d3d12Dst := filepath.Join(optiSubDir, "D3D12_OptiScaler", "D3D12Core.dll")
+	if _, err := os.Stat(d3d12Src); err == nil {
+		_ = copyFile(d3d12Src, d3d12Dst)
+	}
+
+	// Step 3: Copy and configure OptiScaler.ini
+	iniSrc := filepath.Join(srcPath, "OptiScaler.ini.default")
+	iniDst := filepath.Join(targetDir, "OptiScaler.ini")
+	if _, err := os.Stat(iniSrc); err == nil {
+		if err := copyFile(iniSrc, iniDst); err != nil {
+			writeLog("InstallOptiScaler: ERROR - Failed to copy OptiScaler.ini: " + err.Error())
+			return PatchResult{Success: false, Message: "Failed to copy OptiScaler.ini: " + err.Error()}
+		}
+		writeLog("InstallOptiScaler: Copied OptiScaler.ini")
+
+		// Configure INI based on GPU
+		configureOptiScalerINI(iniDst, isNvidia, isRTX50)
+	}
+
+	// Step 4: Copy NR forwarder as Nvngx_dlssr.dll (what OptiScaler v3 expects)
+	nrShimSrc := filepath.Join(dlss5Path, "nvngx.dll_dlssnr.dll")
+	nrShimDst := filepath.Join(targetDir, "Nvngx_dlssr.dll")
+	if _, err := os.Stat(nrShimSrc); err == nil {
+		_ = copyFile(nrShimSrc, nrShimDst)
+		writeLog("InstallOptiScaler: Copied NR forwarder as Nvngx_dlssr.dll")
+	}
+
+	// Step 4b: Also copy original NR files to OptiScaler subdirectory
+	if _, err := os.Stat(nrShimSrc); err == nil {
+		_ = copyFile(nrShimSrc, filepath.Join(optiSubDir, "nvngx.dll_dlssnr.dll"))
+		writeLog("InstallOptiScaler: Copied nvngx.dll_dlssnr.dll to OptiScaler subdirectory")
+	}
+
+	// Step 5: Always copy NR model for OptiScaler — it handles its own
+	// fallback when the GPU does not support neural rendering.
+	nrSrc := filepath.Join(dlss5Path, "nvngx_dlssnr.dll")
+	nrDst := filepath.Join(targetDir, "Nvngx_dlssm.dll")
+	if _, err := os.Stat(nrSrc); err == nil {
+		if err := copyFile(nrSrc, nrDst); err != nil {
+			writeLog("InstallOptiScaler: WARNING - Failed to copy NR model as Nvngx_dlssm.dll: " + err.Error())
+		} else {
+			writeLog("InstallOptiScaler: Copied NR model as Nvngx_dlssm.dll")
+		}
+		// Also copy original NR model to OptiScaler subdirectory
+		_ = copyFile(nrSrc, filepath.Join(optiSubDir, "nvngx_dlssnr.dll"))
+		writeLog("InstallOptiScaler: Copied nvngx_dlssnr.dll to OptiScaler subdirectory")
+	} else {
+		writeLog("InstallOptiScaler: WARNING - nvngx_dlssnr.dll not found in " + dlss5Path)
+	}
+
+	// Step 6: Rename OptiScaler.dll to dxgi.dll (proxy DLL)
+	optiSrc := filepath.Join(srcPath, "OptiScaler.dll")
+	optiDst := filepath.Join(targetDir, "dxgi.dll")
+	if _, err := os.Stat(optiSrc); err != nil {
+		return PatchResult{Success: false, Message: "OptiScaler.dll not found in data directory"}
+	}
+	if err := copyFile(optiSrc, optiDst); err != nil {
+		writeLog("InstallOptiScaler: ERROR - Failed to copy OptiScaler.dll as dxgi.dll: " + err.Error())
+		return PatchResult{Success: false, Message: "Failed to install OptiScaler proxy: " + err.Error()}
+	}
+	writeLog("InstallOptiScaler: Installed OptiScaler.dll as dxgi.dll (proxy)")
+
+	// Step 7: Spread OptiScaler to additional hook directories
+	allTargetDirs := a.findAllTargetDirs(gamePath)
+	allHookDirs := a.findAllReShadeHookDirs(gamePath)
+	addonDirs := allTargetDirs
+	for _, hookDir := range allHookDirs {
+		addonDirs = append(addonDirs, hookDir)
+	}
+	addonDirs = a.uniqueDirs(addonDirs)
+
+	for _, dir := range addonDirs {
+		if isSameOrChildDirectory(dir, targetDir) {
+			continue
+		}
+		lowerDir := strings.ToLower(dir)
+		if strings.Contains(lowerDir, "backup") || strings.Contains(lowerDir, "redist") {
+			continue
+		}
+
+		hasHook := false
+		for _, cf := range []string{"dxgi.dll", "d3d11.dll", "d3d12.dll", "nvngx_dlss.dll"} {
+			if _, err := os.Stat(filepath.Join(dir, cf)); err == nil {
+				hasHook = true
+				break
+			}
+		}
+		if !hasHook {
+			continue
+		}
+
+		// Copy OptiScaler.ini and proxy dll to additional dirs
+		_ = copyFile(iniDst, filepath.Join(dir, "OptiScaler.ini"))
+		_ = copyFile(optiDst, filepath.Join(dir, "dxgi.dll"))
+		_ = copyFile(nrShimDst, filepath.Join(dir, "Nvngx_dlssr.dll"))
+		if isRTX50 {
+			_ = copyFile(filepath.Join(targetDir, "Nvngx_dlssm.dll"), filepath.Join(dir, "Nvngx_dlssm.dll"))
+		}
+
+		// Create OptiScaler subdirectory and copy backends
+		dirOpti := filepath.Join(dir, "OptiScaler")
+		os.MkdirAll(dirOpti, 0755)
+		os.MkdirAll(filepath.Join(dirOpti, "D3D12_OptiScaler"), 0755)
+		for _, file := range backendFiles {
+			src := filepath.Join(optiSubDir, file)
+			dst := filepath.Join(dirOpti, file)
+			if _, err := os.Stat(src); err == nil {
+				_ = copyFile(src, dst)
+			}
+		}
+		_ = copyFile(d3d12Dst, filepath.Join(dirOpti, "D3D12_OptiScaler", "D3D12Core.dll"))
+	}
+
+	writeLog("InstallOptiScaler: All OptiScaler files installed successfully")
+	return PatchResult{Success: true, Message: "OptiScaler installed successfully"}
+}
+
+// configureOptiScalerINI modifies OptiScaler.ini based on detected GPU
+func configureOptiScalerINI(iniPath string, isNvidia bool, isRTX50 bool) {
+	data, err := os.ReadFile(iniPath)
+	if err != nil {
+		writeLog("configureOptiScalerINI: Failed to read INI: " + err.Error())
+		return
+	}
+	content := string(data)
+
+	// Disable FPS overlay by default
+	content = strings.Replace(content, "ShowFps = true", "ShowFps = false", 1)
+	writeLog("configureOptiScalerINI: FPS overlay disabled")
+
+	// Configure spoofing based on GPU vendor
+	if isNvidia {
+		content = strings.Replace(content, "Dxgi = auto", "Dxgi = false", 1)
+		writeLog("configureOptiScalerINI: NVIDIA detected — Dxgi spoofing disabled")
+	} else {
+		content = strings.Replace(content, "Dxgi = auto", "Dxgi = true", 1)
+		writeLog("configureOptiScalerINI: AMD/Intel detected — Dxgi spoofing enabled")
+	}
+
+	// Configure Neural Rendering based on GPU
+	if isRTX50 {
+		content = regexp.MustCompile(`(?m)(\[DlssNr\][\s\S]*?Enabled\s*=\s*)auto`).ReplaceAllString(content, "${1}true")
+		writeLog("configureOptiScalerINI: RTX 50 detected — DLSS 5 Neural Rendering enabled")
+	} else if !isNvidia {
+		content = regexp.MustCompile(`(?m)(\[DlssNr\][\s\S]*?Enabled\s*=\s*)auto`).ReplaceAllString(content, "${1}false")
+		writeLog("configureOptiScalerINI: Non-NVIDIA GPU — DLSS 5 Neural Rendering disabled")
+	} else {
+		writeLog("configureOptiScalerINI: NVIDIA GPU (detection inconclusive) — DLSS 5 Neural Rendering left as auto")
+	}
+
+	if err := os.WriteFile(iniPath, []byte(content), 0644); err != nil {
+		writeLog("configureOptiScalerINI: Failed to write INI: " + err.Error())
+	}
+}
+
+// PatchGame performs the complete patch: ReShade + DLSS 5 or OptiScaler
 func (a *App) PatchGame(gamePath string) PatchResult {
-	writeLog("=== PatchGame: Starting patch process for " + gamePath + " ===")
+	return a.PatchGameWithMode(gamePath, "reshade")
+}
+
+// PatchGameWithMode performs the complete patch using the selected mode ("reshade" or "optiscaler")
+func (a *App) PatchGameWithMode(gamePath string, mode string) PatchResult {
+	writeLog(fmt.Sprintf("=== PatchGameWithMode: Starting patch process for %s (mode: %s) ===", gamePath, mode))
 
 	if strings.TrimSpace(gamePath) == "" {
 		writeLog("PatchGame: FAILED - Empty game path provided")
@@ -2094,28 +2746,37 @@ func (a *App) PatchGame(gamePath string) PatchResult {
 		}
 	}
 
-	writeLog("PatchGame: Step 1 - Backing up original files")
+	writeLog("PatchGameWithMode: Step 1 - Backing up original files")
 	backupResult := a.BackupOriginalFiles(gamePath)
 	if !backupResult.Success {
-		writeLog("PatchGame: Backup warning: " + backupResult.Message)
+		writeLog("PatchGameWithMode: Backup warning: " + backupResult.Message)
 	}
 
-	writeLog("PatchGame: Step 2 - Installing ReShade")
-	result := a.InstallReshade(gamePath)
-	if !result.Success {
-		writeLog("PatchGame: FAILED - ReShade installation failed: " + result.Message)
-		return result
+	if mode == "optiscaler" {
+		writeLog("PatchGameWithMode: Step 2 - Installing OptiScaler")
+		result := a.InstallOptiScaler(gamePath)
+		if !result.Success {
+			writeLog("PatchGameWithMode: FAILED - OptiScaler installation failed: " + result.Message)
+			return result
+		}
+	} else {
+		writeLog("PatchGameWithMode: Step 2 - Installing ReShade")
+		result := a.InstallReshade(gamePath)
+		if !result.Success {
+			writeLog("PatchGameWithMode: FAILED - ReShade installation failed: " + result.Message)
+			return result
+		}
+
+		writeLog("PatchGameWithMode: Step 3 - Installing DLSS 5 files")
+		result = a.InstallDLSS5(gamePath)
+		if !result.Success {
+			writeLog("PatchGameWithMode: FAILED - DLSS 5 installation failed: " + result.Message)
+			return result
+		}
 	}
 
-	writeLog("PatchGame: Step 3 - Installing DLSS 5 files")
-	result = a.InstallDLSS5(gamePath)
-	if !result.Success {
-		writeLog("PatchGame: FAILED - DLSS 5 installation failed: " + result.Message)
-		return result
-	}
-
-	writeLog("=== PatchGame: Patch process completed successfully ===")
-	return PatchResult{Success: true, Message: "DLSS 5 Patch applied successfully!"}
+	writeLog("=== PatchGameWithMode: Patch process completed successfully ===")
+	return PatchResult{Success: true, Message: "Patch applied successfully (" + mode + ")!"}
 }
 
 // backupDefaultConfig is a small helper that remembers a config file for
@@ -2287,6 +2948,9 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 		"dlss5-feed.log",
 		"renodx-dlss5.addon64",
 		"renodx-dlss5.addon32",
+		"OptiScaler.ini",
+		"OptiScaler.log",
+		"nvngx.dll_dlssnr.dll",
 	}
 
 	// The DLSS 5 add-on / feed files are placed by this patcher and never
@@ -2305,6 +2969,7 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 	foldersToRemove := []string{
 		"reshade-shaders",
 		"ReShade",
+		"OptiScaler",
 	}
 
 	// Any ReShade hook DLL or add-on that the game shipped must never be
@@ -2488,12 +3153,19 @@ func (a *App) GetAppVersion() string {
 	return "1.0.0"
 }
 
-// GetSystemInfo returns system information
+// GetSystemInfo returns system information including detected GPU
 func (a *App) GetSystemInfo() map[string]string {
+	gpu := detectGPU()
+	nrStatus := "No"
+	if gpu.SupportsNeuralRendering {
+		nrStatus = "Yes"
+	}
 	return map[string]string{
-		"os":        goruntime.GOOS,
-		"arch":      goruntime.GOARCH,
-		"goVersion": goruntime.Version(),
-		"numCPU":    fmt.Sprintf("%d", goruntime.NumCPU()),
+		"os":            goruntime.GOOS,
+		"arch":          goruntime.GOARCH,
+		"goVersion":     goruntime.Version(),
+		"numCPU":        fmt.Sprintf("%d", goruntime.NumCPU()),
+		"gpu":           gpu.Name,
+		"neuralRender":  nrStatus,
 	}
 }

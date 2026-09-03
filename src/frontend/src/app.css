@@ -19,6 +19,76 @@
     font-weight: bold;
 }
 
+.gpu-preview {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+}
+
+.gpu-preview-label {
+    color: #aaa;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.gpu-preview-value {
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.gpu-select {
+    background: #121315;
+    color: #fff;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 13px;
+    font-weight: 600;
+    max-width: 320px;
+    outline: none;
+    cursor: pointer;
+}
+
+.gpu-select:focus {
+    border-color: #00ff88;
+}
+
+.gpu-refresh-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+}
+
+.gpu-preview-badge {
+    font-size: 12px;
+    font-weight: 700;
+    padding: 2px 10px;
+    border-radius: 12px;
+    color: #fff;
+}
+
+.gpu-preview-badge.badge-yes {
+    background: #00c853;
+    color: #00180a;
+}
+
+.gpu-preview-badge.badge-no {
+    background: #555;
+}
+
+.gpu-preview-badge.badge-unknown {
+    background: #ff9800;
+    color: #1a1200;
+}
+
 .main {
     display: flex;
     flex-direction: column;
@@ -539,6 +609,72 @@
     width: 100%;
     padding: 18px 30px;
     font-size: 18px;
+}
+
+.patch-mode-toggle {
+    margin-bottom: 15px;
+}
+
+.mode-label {
+    display: block;
+    color: #aaa;
+    font-size: 13px;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.mode-options {
+    display: flex;
+    gap: 8px;
+}
+
+.mode-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 12px 16px;
+    border: 2px solid #333;
+    border-radius: 8px;
+    background: #1a1a1a;
+    color: #888;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    text-align: center;
+}
+
+.mode-btn-title {
+    line-height: 1.25;
+}
+
+.mode-recommended {
+    display: inline-flex;
+    align-items: center;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #00180a;
+    background: #00ff88;
+    border-radius: 10px;
+    padding: 2px 10px;
+    box-shadow: 0 0 8px rgba(0, 255, 136, 0.4);
+}
+
+.mode-btn:hover {
+    border-color: #555;
+    color: #ccc;
+}
+
+.mode-btn-active {
+    border-color: #00ff88;
+    color: #00ff88;
+    background: rgba(0, 255, 136, 0.08);
+    box-shadow: 0 0 12px rgba(0, 255, 136, 0.15);
 }
 
 .progress {
