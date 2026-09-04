@@ -27,6 +27,11 @@ export namespace main {
 	    optiScalerStatus: string;
 	    isInstalled: boolean;
 	    dllList: DLLDetail[];
+	    gpuName: string;
+	    neuralSupport: boolean;
+	    neuralNote: string;
+	    neuralNoteLevel: string;
+	    coverArt: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new GameDetails(source);
@@ -44,6 +49,11 @@ export namespace main {
 	        this.optiScalerStatus = source["optiScalerStatus"];
 	        this.isInstalled = source["isInstalled"];
 	        this.dllList = this.convertValues(source["dllList"], DLLDetail);
+	        this.gpuName = source["gpuName"];
+	        this.neuralSupport = source["neuralSupport"];
+	        this.neuralNote = source["neuralNote"];
+	        this.neuralNoteLevel = source["neuralNoteLevel"];
+	        this.coverArt = source["coverArt"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -91,6 +101,7 @@ export namespace main {
 	    vram: number;
 	    selected: boolean;
 	    active: boolean;
+	    nrTier: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new GpuInfo(source);
@@ -104,6 +115,7 @@ export namespace main {
 	        this.vram = source["vram"];
 	        this.selected = source["selected"];
 	        this.active = source["active"];
+	        this.nrTier = source["nrTier"];
 	    }
 	}
 	export class PatchResult {

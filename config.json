@@ -1,0 +1,7 @@
+{
+  "gpu_selection": "NVIDIA GeForce RTX 5070",
+  "reshade_setup_url": "",
+  "reshade_url": "https://example.com/dlss5/reshade.zip",
+  "optiscaler_url": "https://example.com/dlss5/optiscaler.zip",
+  "dlss5_url": "https://example.com/dlss5/dlss5.zip"
+}

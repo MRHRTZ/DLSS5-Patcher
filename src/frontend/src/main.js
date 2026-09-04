@@ -13,11 +13,6 @@ document.querySelector('#app').innerHTML = `
           <option value="">Detecting...</option>
         </select>
         <span class="gpu-preview-badge" id="gpuNRBadge">NR: --</span>
-        <button id="gpuRefreshBtn" class="btn-icon gpu-refresh-btn" title="Refresh GPU detection" aria-label="Refresh GPU detection">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
-          </svg>
-        </button>
       </div>
     </header>
 
@@ -61,13 +56,13 @@ document.querySelector('#app').innerHTML = `
           <div class="patch-mode-toggle">
             <label class="mode-label">Patch Method:</label>
             <div class="mode-options">
-              <button id="modeReshade" class="mode-btn mode-btn-active" data-mode="reshade">
+              <button id="modeOptiscaler" class="mode-btn mode-btn-active" data-mode="optiscaler">
+                <span class="mode-btn-title">OptiScaler (FSR/XeSS/DLSS)</span>
+                <span class="mode-recommended" id="modeOptiscalerRec">Recommended</span>
+              </button>
+              <button id="modeReshade" class="mode-btn" data-mode="reshade">
                 <span class="mode-btn-title">ReShade + DLSS 5 Add-On</span>
                 <span class="mode-recommended" id="modeReshadeRec">Recommended</span>
-              </button>
-              <button id="modeOptiscaler" class="mode-btn" data-mode="optiscaler">
-                <span class="mode-btn-title">OptiScaler (FSR / XeSS / DLSS)</span>
-                <span class="mode-recommended" id="modeOptiscalerRec">Recommended</span>
               </button>
             </div>
           </div>
@@ -113,9 +108,9 @@ let selectedGame = null;
 let games = [];
 let isScanning = false;
 let searchQuery = '';
-let patchMode = 'reshade';
-let gpuNR = null; // true = RTX 50 neural rendering, false = not supported, null = unknown
+let patchMode = 'optiscaler';
 let modeManuallySet = false;
+let reshadeRecommended = false;
 
 // Normalize game object to have consistent lowercase property keys
 function normalizeGame(game) {
@@ -273,12 +268,19 @@ async function selectGame(game) {
       selectedGame.isInstalled = !!details.isInstalled;
     }
 
+    // DirectX 11 games should prefer ReShade (OptiScaler's Neural Rendering
+    // needs DirectX 12). The backend flags this via neuralNote.
+    reshadeRecommended = !!(details.neuralNote && details.neuralNote.indexOf('ReShade method') !== -1);
+    applyRecommendedMode();
+
     const initial = (details.name || selectedGame.name || 'G').charAt(0).toUpperCase();
 
     folderContents.innerHTML = `
       <div class="game-details-card">
         <div class="details-header">
-          <div class="game-avatar">${initial}</div>
+          ${details.coverArt ? `
+            <div class="game-cover"><img class="game-cover-img" src="${details.coverArt}" alt="${details.name || selectedGame.name}" onerror="this.closest('.game-cover').remove();"></div>
+          ` : `<div class="game-avatar">${initial}</div>`}
           <div class="game-title-group">
             <h3 class="game-title">${details.name || selectedGame.name}</h3>
             <div class="game-subtitle">Game folder:</div>
@@ -293,7 +295,7 @@ async function selectGame(game) {
           </div>
           <div class="details-row">
             <span class="row-label">Rendering API</span>
-            <span class="row-value api-value">${details.renderingAPI || 'DirectX 12'}</span>
+            <span class="row-value api-value">${details.renderingAPI || 'DXGI (DirectX 11/12)'}</span>
           </div>
           <div class="details-row">
             <span class="row-label">DLSS</span>
@@ -311,7 +313,20 @@ async function selectGame(game) {
             <span class="row-label">OptiScaler</span>
             <span class="row-value ${details.optiScalerStatus !== 'Not Installed' ? 'status-green' : 'status-muted'}">${details.optiScalerStatus || 'Not Installed'}</span>
           </div>
+          ${details.gpuName ? `
+          <div class="details-row">
+            <span class="row-label">GPU</span>
+            <span class="row-value api-value">${details.gpuName}</span>
+          </div>
+          ` : ''}
         </div>
+
+        ${details.neuralNote ? `
+          <div class="neural-warning ${details.neuralNoteLevel === 'info' ? 'neural-info' : ''}">
+            <span class="neural-warning-icon">${details.neuralNoteLevel === 'info' ? '&#9432;' : '&#9888;'}</span>
+            <span>${details.neuralNote}</span>
+          </div>
+        ` : ''}
 
         ${details.dllList && details.dllList.length > 0 ? `
           <div class="dll-table-container">
@@ -684,6 +699,8 @@ function renderGpuSelect(gpus) {
     opt.value = g.name || '';
     let label = g.name || 'Unknown GPU';
     if (g.vendor) label = g.vendor + ' | ' + label;
+    const tier = nrTierLabel(g);
+    if (tier) label += ' [' + tier + ']';
     opt.textContent = label;
     if (g.selected || g.active) opt.textContent += ' (active)';
     return opt;
@@ -698,37 +715,42 @@ function renderGpuSelect(gpus) {
   if (active) {
     sel.value = active.name || '';
     updateNRBadge(nrBadgeElem, active);
-    gpuNR = !!(active.supportsNeuralRendering ?? active.SupportsNeuralRendering);
   } else {
-    gpuNR = null;
     updateNRBadge(nrBadgeElem, null);
   }
 
+  // No game context yet during GPU load, so default recommendation is OptiScaler.
+  reshadeRecommended = false;
   applyRecommendedMode();
 
-  // Set default patch method from GPU NR support if the user hasn't chosen one yet.
-  // Only an RTX 50 (NR supported) defaults to ReShade; otherwise (NR No or
-  // unknown) OptiScaler is the safe cross-vendor default.
-  if (!modeManuallySet) {
-    if (gpuNR === true && patchMode !== 'reshade') {
-      setPatchMode('reshade');
-    } else if (gpuNR !== true && patchMode !== 'optiscaler') {
-      setPatchMode('optiscaler');
-    }
+  // Default to OptiScaler (always recommended) unless user has manually chosen.
+  if (!modeManuallySet && patchMode !== 'optiscaler') {
+    setPatchMode('optiscaler');
   }
 
   if (preview) preview.style.display = 'flex';
 }
 
-// applyRecommendedMode sets the (Recommended) badge based on the active GPU's
-// Neural Rendering support:
-//   - NR supported (RTX 50)  -> ReShade + DLSS 5 Add-On is recommended
-//   - NR not supported       -> OptiScaler is recommended
-//   - unknown                -> OptiScaler is recommended (cross-vendor safe)
+// applyRecommendedMode highlights the patch method best suited to the game AND,
+// when the user has not explicitly chosen a method, auto-selects that method.
+// Default (cross-vendor safe) is OptiScaler; for DirectX 11 games where
+// OptiScaler's Neural Rendering needs DirectX 12, ReShade is recommended.
 function applyRecommendedMode() {
-  const reshadeRecommended = gpuNR === true; // only RTX 50 -> reshade
-  document.getElementById('modeReshadeRec').style.display = reshadeRecommended ? 'inline-flex' : 'none';
-  document.getElementById('modeOptiscalerRec').style.display = reshadeRecommended ? 'none' : 'inline-flex';
+  const recReshade = document.getElementById('modeReshadeRec');
+  const recOpti = document.getElementById('modeOptiscalerRec');
+  if (reshadeRecommended) {
+    recOpti.style.display = 'none';
+    recReshade.style.display = 'inline-flex';
+    if (!modeManuallySet && patchMode !== 'reshade') {
+      setPatchMode('reshade');
+    }
+  } else {
+    recReshade.style.display = 'none';
+    recOpti.style.display = 'inline-flex';
+    if (!modeManuallySet && patchMode !== 'optiscaler') {
+      setPatchMode('optiscaler');
+    }
+  }
 }
 
 function updateNRBadge(elem, gpu) {
@@ -741,7 +763,8 @@ function updateNRBadge(elem, gpu) {
   }
   const nr = !!(gpu.supportsNeuralRendering ?? gpu.SupportsNeuralRendering);
   if (nr) {
-    elem.textContent = 'NR: Yes';
+    const tier = nrTierLabel(gpu);
+    elem.textContent = 'NR: Yes' + (tier ? ' (' + tier + ')' : '');
     elem.classList.add('badge-yes');
   } else {
     elem.textContent = 'NR: No';
@@ -749,38 +772,55 @@ function updateNRBadge(elem, gpu) {
   }
 }
 
+// nrTierLabel maps a GPU's nrTier field to a short human-readable label.
+function nrTierLabel(gpu) {
+  if (!gpu) return '';
+  const tier = String(gpu.nrTier != null ? gpu.nrTier : gpu.NRTier || '');
+  switch (tier) {
+    case 'rtx20-30': return 'RTX 20-30';
+    case 'rtx40-50': return 'RTX 40-50';
+    case 'none': return 'no NR';
+    default: return '';
+  }
+}
+
 function setupGpuControls() {
   const sel = document.getElementById('gpuSelect');
-  const refreshBtn = document.getElementById('gpuRefreshBtn');
 
-  if (sel) {
-    sel.addEventListener('change', async () => {
-      const name = sel.value;
-      try {
-        const active = await SelectGPU(name);
-        if (active) {
-          refreshGpuBadge();
-        }
-      } catch (err) {
-        console.error('Failed to select GPU:', err);
+  if (!sel) return;
+
+  // Refresh the GPU list every time the dropdown is opened so detection is
+  // always current (replaces the old refresh button).
+  sel.addEventListener('mousedown', async () => {
+    // Avoid re-triggering while the list is already being refreshed.
+    if (sel.dataset.refreshing === 'true') return;
+    sel.dataset.refreshing = 'true';
+    try {
+      const fresh = await RefreshGPUs();
+      renderGpuSelect(fresh);
+    } catch (err) {
+      console.error('Failed to refresh GPU list:', err);
+    } finally {
+      delete sel.dataset.refreshing;
+    }
+  });
+
+  sel.addEventListener('change', async () => {
+    const name = sel.value;
+    try {
+      const active = await SelectGPU(name);
+      if (active) {
+        refreshGpuBadge();
       }
-    });
-  }
-  if (refreshBtn) {
-    refreshBtn.addEventListener('click', async () => {
-      refreshBtn.disabled = true;
-      refreshBtn.classList.add('spinning');
-      const sel2 = document.getElementById('gpuSelect');
-      if (sel2) sel2.replaceChildren(new Option('Detecting...', ''));
-      try {
-        const fresh = await RefreshGPUs();
-        renderGpuSelect(fresh);
-      } finally {
-        refreshBtn.disabled = false;
-        refreshBtn.classList.remove('spinning');
-      }
-    });
-  }
+    } catch (err) {
+      console.error('Failed to select GPU:', err);
+    }
+    // The NR warning/info depends on the GPU, so re-evaluate the currently selected
+    // game to refresh its preview and the ReShade/OptiScaler recommendation.
+    if (selectedGame && selectedGame.path) {
+      await selectGame(selectedGame);
+    }
+  });
 }
 
 async function refreshGpuBadge() {
@@ -837,12 +877,12 @@ function updatePatchButton() {
   const uninstallBtn = document.getElementById('uninstallBtn');
   if (patchMode === 'optiscaler') {
     patchBtn.textContent = selectedGame?.isInstalled
-      ? 'Re-Patch Game — OptiScaler (FSR / XeSS / DLSS)'
-      : 'Patch Game — Install OptiScaler (FSR / XeSS / DLSS)';
+      ? 'Re-Patch Game - OptiScaler (FSR/XeSS/DLSS)'
+      : 'Patch Game - Install OptiScaler (FSR/XeSS/DLSS)';
   } else {
     patchBtn.textContent = selectedGame?.isInstalled
-      ? 'Re-Patch Game — ReShade + DLSS 5 Add-On'
-      : 'Patch Game — Install ReShade + DLSS 5 Add-On';
+      ? 'Re-Patch Game - ReShade + DLSS 5 Add-On'
+      : 'Patch Game - Install ReShade + DLSS 5 Add-On';
   }
   uninstallBtn.textContent = 'Uninstall Patch';
 }

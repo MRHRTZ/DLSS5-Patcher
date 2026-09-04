@@ -1,9 +1,11 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"debug/pe"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -67,12 +69,56 @@ func vtableRelease(objPtr uintptr) {
 	vtableCall(objPtr, 2)
 }
 
+// NRTier describes which DLSS 5 Neural Rendering shim a GPU should use.
+type NRTier string
+
+const (
+	NRTierUnknown  NRTier = ""
+	NRTierNone     NRTier = "none"
+	NRTierRTX20_30 NRTier = "rtx20-30"
+	NRTierRTX40_50 NRTier = "rtx40-50"
+)
+
 // gpuInfo holds detected GPU metadata.
 type gpuInfo struct {
 	Name                   string
-	SupportsNeuralRendering bool  // true only for RTX 50 (Blackwell) series
+	SupportsNeuralRendering bool  // true when the GPU can run DLSS NR (RTX 20-50)
 	Vendor                  string // "NVIDIA", "AMD", "Intel", "Virtual", ""
 	VRAM                    uint64 // dedicated video memory in bytes
+	NRTier                  NRTier // which neural-renderer shim this GPU needs
+}
+
+// classifyNVIDIA determines the neural-rendering tier from an NVIDIA GPU name.
+// RTX 20-30 series use the full 158MB model shim; RTX 40-50 use the small 108KB
+// forwarder shim. Any other NVIDIA card (GTX etc.) cannot run the pass.
+func classifyNVIDIA(name string) (neural bool, tier NRTier) {
+	lower := strings.ToLower(name)
+	hasRTX := strings.Contains(lower, "rtx")
+	hasGTX := strings.Contains(lower, "gtx")
+	if !hasRTX && !hasGTX {
+		// Modern Quadro/RTX A-series advertises "RTX" in the name too.
+		return false, NRTierNone
+	}
+	isRTX40 := regexp.MustCompile(`rtx\s?40\d\d`).MatchString(lower)
+	isRTX50 := regexp.MustCompile(`rtx\s?50\d\d`).MatchString(lower)
+	isRTX20 := regexp.MustCompile(`rtx\s?20\d\d`).MatchString(lower)
+	isRTX30 := regexp.MustCompile(`rtx\s?30\d\d`).MatchString(lower)
+	if isRTX40 || isRTX50 {
+		return true, NRTierRTX40_50
+	}
+	if isRTX20 || isRTX30 {
+		// RTX 20-30 can still need the 158MB model shim only for *loading* the
+		// pass, but Neural Rendering itself does not run on them (the NGX
+		// runtime rejects the model). Keep the tier so the correct shim is
+		// deployed, but report neural support as false so DLSS-NR is disabled.
+		return false, NRTierRTX20_30
+	}
+	// RTX without a clear 4-number marker (e.g. "RTX A6000", "Quadro RTX").
+	// Assume modern RTX is 40-50 tier (safe default); GTX is none.
+	if hasRTX {
+		return true, NRTierRTX40_50
+	}
+	return false, NRTierNone
 }
 
 // isVirtualAdapter reports whether a GPU name belongs to a virtual or remote
@@ -148,11 +194,16 @@ func detectGPUsUncached() []gpuInfo {
 			if rev == 0 {
 				name := strings.TrimRight(syscall.UTF16ToString(desc.Description[:]), "\x00")
 				vendor := gpuVendor(desc.VendorID, name)
+				neural, tier := false, NRTierNone
+				if vendor == "NVIDIA" {
+					neural, tier = classifyNVIDIA(name)
+				}
 				info := gpuInfo{
 					Name:                   name,
-					SupportsNeuralRendering: strings.Contains(name, "RTX 50"),
+					SupportsNeuralRendering: neural,
 					Vendor:                 vendor,
 					VRAM:                   uint64(desc.DedicatedVideoMemory),
+					NRTier:                 tier,
 				}
 				if isVirtualAdapter(name) || vendor == "Virtual" {
 					virtual = append(virtual, info)
@@ -213,10 +264,15 @@ func detectGPUsFromRegistry() (real, virtual []gpuInfo) {
 		_ = k.Close()
 
 		vendor := gpuVendor(0, desc)
+		neural, tier := false, NRTierNone
+		if vendor == "NVIDIA" {
+			neural, tier = classifyNVIDIA(desc)
+		}
 		info := gpuInfo{
 			Name:                   desc,
-			SupportsNeuralRendering: strings.Contains(desc, "RTX 50"),
+			SupportsNeuralRendering: neural,
 			Vendor:                 vendor,
+			NRTier:                 tier,
 		}
 		if isVirtualAdapter(desc) || vendor == "Virtual" {
 			virtual = append(virtual, info)
@@ -320,8 +376,14 @@ func equalGPUName(a, b string) bool {
 
 const gpuSelectionFile = "gpu_selection.json"
 
-// selectedGPUName reads the user's persisted GPU selection, if any.
+// selectedGPUName reads the user's persisted GPU selection from config.json.
+// Falls back to the legacy gpu_selection.json when config is empty (backward
+// compatibility with older installs).
 func selectedGPUName() string {
+	if sel := loadAppConfig().GPUSelection; sel != "" {
+		return sel
+	}
+	// Legacy fallback.
 	p := getAssetPath(gpuSelectionFile)
 	data, err := os.ReadFile(p)
 	if err != nil {
@@ -336,10 +398,25 @@ func selectedGPUName() string {
 	return sel.GPU
 }
 
-// saveGPUSelection persists the user's chosen GPU name.
+// saveGPUSelection persists the user's chosen GPU name into config.json,
+// preserving the other config fields.
 func saveGPUSelection(name string) error {
-	p := getAssetPath(gpuSelectionFile)
-	data, _ := json.Marshal(map[string]string{"gpu": name})
+	cfg := loadAppConfig()
+	cfg.GPUSelection = name
+	return writeAppConfig(cfg)
+}
+
+// writeAppConfig writes the consolidated config.json back to disk, creating the
+// asset directory if needed.
+func writeAppConfig(cfg appConfig) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	p := getAssetPath(configFile)
+	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+		return err
+	}
 	return os.WriteFile(p, data, 0644)
 }
 
@@ -351,6 +428,7 @@ type GpuInfo struct {
 	VRAM                   uint64 `json:"vram"`
 	Selected               bool   `json:"selected"`
 	Active                 bool   `json:"active"`
+	NRTier                 string `json:"nrTier"`
 }
 
 func gpuToInfo(g gpuInfo, selected string, activeName string) GpuInfo {
@@ -361,6 +439,7 @@ func gpuToInfo(g gpuInfo, selected string, activeName string) GpuInfo {
 		VRAM:                   g.VRAM,
 		Selected:               selected != "" && equalGPUName(g.Name, selected),
 		Active:                 equalGPUName(g.Name, activeName),
+		NRTier:                 string(g.NRTier),
 	}
 }
 
@@ -469,52 +548,80 @@ func getAssetPath(subPath string) string {
 }
 
 const (
-	reshadeConfigFile = "ReShadeConfig.json"
-	defaultReShadeURL = "https://reshade.me/downloads/ReShade_Setup_6.8.0.exe"
+	configFile       = "config.json"
+	reshadeSetupDir  = "reshade-setup"
 	defaultReShadeExe = "ReShade_Setup_6.8.0.exe"
+	reshadeAddonExe  = "ReShade_Setup_6.8.0_Addon.exe"
 )
 
-type reshadeConfig struct {
-	URL string `json:"url"`
+// appConfig is the single consolidated configuration file (config.json). All
+// settings live here: the active GPU selection plus one URL per downloadable
+// data set. URLs are zip archives; if the matching local data is incomplete the
+// app downloads it, and an empty URL means "show an error dialog instead".
+type appConfig struct {
+	GPUSelection    string `json:"gpu_selection"`
+	ReShadeSetupURL string `json:"reshade_setup_url"`
+	ReShadeURL      string `json:"reshade_url"`
+	OptiScalerURL   string `json:"optiscaler_url"`
+	DLSS5URL        string `json:"dlss5_url"`
 }
 
-// getReShadeSetup resolves the ReShade setup executable path, checking a
-// config file first, then well-known local installs, then the bundled Addon
-// build as a last resort. If none exists, it will be downloaded on demand.
-func getReShadeSetup() (string, error) {
-	candidates := []string{
-		// 1. User-configured path
-		getAssetPath(reshadeConfigFile),
-		getAssetPath(filepath.Join("ReShade", reshadeConfigFile)),
-		getAssetPath(filepath.Join("ReShade", "ReShade_Setup_6.8.0_Addon.exe")),
-		getAssetPath(filepath.Join("ReShade", defaultReShadeExe)),
+// defaultAppConfig returns the default config with dummy download URLs. Only
+// reshade_setup_url is left empty because the ReShade setup already ships
+// locally (data/reshade-setup); the rest would need real sources.
+func defaultAppConfig() appConfig {
+	return appConfig{
+		GPUSelection:    "",
+		ReShadeSetupURL: "",
+		ReShadeURL:      "https://example.com/dlss5/reshade.zip",
+		OptiScalerURL:   "https://example.com/dlss5/optiscaler.zip",
+		DLSS5URL:        "https://example.com/dlss5/dlss5.zip",
 	}
+}
 
-	configuredURL := ""
-	if cfg, err := os.ReadFile(candidates[0]); err == nil {
-		var config reshadeConfig
-		if err := json.Unmarshal(cfg, &config); err != nil {
-			writeLog("getReShadeSetup: invalid JSON config: " + err.Error())
-		} else {
-			configuredURL = strings.TrimSpace(config.URL)
-		}
+// loadAppConfig reads config.json from the asset path. If the file is missing
+// or invalid it returns the default config (and, when writable, writes it out
+// so the user has a starter file). URLs are trimmed of surrounding whitespace.
+func loadAppConfig() appConfig {
+	cfg := defaultAppConfig()
+	p := getAssetPath(configFile)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		writeLog("loadAppConfig: config.json not found, using defaults (" + p + ")")
+		return cfg
 	}
-	for _, c := range candidates[1:] {
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		writeLog("loadAppConfig: invalid config.json: " + err.Error())
+		return cfg
+	}
+	cfg.GPUSelection = strings.TrimSpace(cfg.GPUSelection)
+	cfg.ReShadeSetupURL = strings.TrimSpace(cfg.ReShadeSetupURL)
+	cfg.ReShadeURL = strings.TrimSpace(cfg.ReShadeURL)
+	cfg.OptiScalerURL = strings.TrimSpace(cfg.OptiScalerURL)
+	cfg.DLSS5URL = strings.TrimSpace(cfg.DLSS5URL)
+	return cfg
+}
+
+// getReShadeSetup resolves the ReShade setup executable path. It first
+// guarantees the reshade-setup data set is complete (downloading from the
+// config URL if needed / erroring when the URL is empty), then returns the
+// bundled Addon build or the plain setup exe.
+func (a *App) getReShadeSetup() (string, error) {
+	setupDir := getAssetPath(filepath.Join("data", reshadeSetupDir))
+	// Ensure the setup data set is present before proceeding.
+	if err := a.ensureDataset("reshade-setup"); err != nil {
+		return "", err
+	}
+	candidates := []string{
+		filepath.Join(setupDir, reshadeAddonExe),
+		filepath.Join(setupDir, defaultReShadeExe),
+	}
+	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
 			return c, nil
 		}
 	}
-
-	downloadURL := defaultReShadeURL
-	if configuredURL != "" {
-		downloadURL = configuredURL
-	}
-	writeLog("getReShadeSetup: No ReShade installer found locally, downloading from " + downloadURL)
-	dest := getAssetPath(filepath.Join("ReShade", defaultReShadeExe))
-	if err := downloadFile(downloadURL, dest); err != nil {
-		return "", fmt.Errorf("failed to download ReShade installer: %v", err)
-	}
-	return dest, nil
+	return "", fmt.Errorf("ReShade setup executable not found in %s", setupDir)
 }
 
 // downloadFile downloads url into dest with a simple progress log.
@@ -540,6 +647,218 @@ func downloadFile(url, dest string) error {
 		return err
 	}
 	writeLog("downloadFile: download complete: " + dest)
+	return nil
+}
+
+// dataDir returns the asset path for a sub-directory under data/.
+func dataDir(sub string) string {
+	return getAssetPath(filepath.Join("data", sub))
+}
+
+// datasetSpec describes a downloadable data set: its label (for messages), the
+// local directory where it lives, its config URL (zip archive, may be empty),
+// and the required files (relative paths) that prove it is complete.
+type datasetSpec struct {
+	label         string
+	dir           string
+	url           string
+	requiredFiles []string
+}
+
+// requiredFilesFor returns the required relative files for a named dataset.
+func requiredFilesFor(label string) []string {
+	switch label {
+	case "reshade-setup":
+		return []string{defaultReShadeExe, filepath.Join("Extracted", "ReShade64.dll")}
+	case "reshade":
+		return []string{
+			"renodx-dlss5.addon64",
+			"dlss5-feed.addon64",
+			filepath.Join("reshade-shaders-source", "Shaders", "DLSS5_Feed.fx"),
+		}
+	case "optiscaler":
+		return []string{
+			"OptiScaler.dll",
+			"OptiScaler.ini.default",
+			filepath.Join("OptiScaler", "libxess.dll"),
+		}
+	case "dlss5":
+		return []string{
+			"nvngx_dlss.dll",
+			"nvngx_dlssnr.dll",
+			"nvngx.dll_dlssnr.dll",
+		}
+	}
+	return nil
+}
+
+// datasetFromConfig builds a datasetSpec from the consolidated config for the
+// requested label. Returns an error for an unknown label.
+func datasetFromConfig(cfg appConfig, label string) (datasetSpec, error) {
+	spec := datasetSpec{label: label, dir: dataDir(label), requiredFiles: requiredFilesFor(label)}
+	if len(spec.requiredFiles) == 0 {
+		return spec, fmt.Errorf("unknown data set: %s", label)
+	}
+	switch label {
+	case "reshade-setup":
+		spec.url = cfg.ReShadeSetupURL
+	case "reshade":
+		spec.url = cfg.ReShadeURL
+	case "optiscaler":
+		spec.url = cfg.OptiScalerURL
+	case "dlss5":
+		spec.url = cfg.DLSS5URL
+	}
+	return spec, nil
+}
+
+// dataComplete reports whether every required file exists under dir.
+func dataComplete(dir string, required []string) bool {
+	for _, r := range required {
+		if _, err := os.Stat(filepath.Join(dir, r)); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// showConfigError surfaces a missing-data error to the user via a native dialog
+// (and the log) so a download-less setup fails with a clear message instead of
+// a silent path error.
+func (a *App) showConfigError(msg string) {
+	writeLog("ConfigDataError: " + msg)
+	if a.ctx != nil && !a.diagnostic {
+		runtime.MessageDialog(a.ctx, runtime.MessageDialogOptions{
+			Type:    runtime.ErrorDialog,
+			Title:   "Missing Data",
+			Message: msg,
+		})
+	}
+}
+
+// ensureDataset verifies that a data set is complete. If it is, nothing
+// happens. If it is not, and a config URL is set, the zip is downloaded and
+// extracted; an empty URL yields a clear error dialog.
+func (a *App) ensureDataset(label string) error {
+	cfg := loadAppConfig()
+	spec, err := datasetFromConfig(cfg, label)
+	if err != nil {
+		a.showConfigError(err.Error())
+		return err
+	}
+	if dataComplete(spec.dir, spec.requiredFiles) {
+		writeLog(fmt.Sprintf("ensureDataset: '%s' already complete at %s", label, spec.dir))
+		return nil
+	}
+
+	if spec.url == "" {
+		err := fmt.Errorf("Data set '%s' is incomplete and no download URL is set in config.json (field '%s'). Please set a valid URL or restore the missing files in %s.",
+			label, configFieldFor(label), spec.dir)
+		a.showConfigError(err.Error())
+		return err
+	}
+
+	writeLog(fmt.Sprintf("ensureDataset: '%s' incomplete at %s — downloading from %s", label, spec.dir, spec.url))
+	if err := a.downloadAndExtractZip(spec.url, spec.dir); err != nil {
+		err2 := fmt.Errorf("Failed to download data set '%s' from %s: %v", label, spec.url, err)
+		a.showConfigError(err2.Error())
+		return err2
+	}
+	if !dataComplete(spec.dir, spec.requiredFiles) {
+		err2 := fmt.Errorf("Downloaded archive for '%s' is still missing required files. The zip layout may not match expectations.", label)
+		a.showConfigError(err2.Error())
+		return err2
+	}
+	writeLog(fmt.Sprintf("ensureDataset: '%s' completed after download", label))
+	return nil
+}
+
+// configFieldFor maps a dataset label back to its config.json field name.
+func configFieldFor(label string) string {
+	switch label {
+	case "reshade-setup":
+		return "reshade_setup_url"
+	case "reshade":
+		return "reshade_url"
+	case "optiscaler":
+		return "optiscaler_url"
+	default:
+		return "dlss5_url"
+	}
+}
+
+// ensureAllDatasets validates every downloadable data set is present before a
+// patch runs. Called at the start of the install paths.
+func (a *App) ensureAllDatasets() error {
+	for _, label := range []string{"reshade-setup", "reshade", "optiscaler", "dlss5"} {
+		if err := a.ensureDataset(label); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// downloadAndExtractZip downloads a zip from url and extracts it into destDir.
+// The archive is expected to contain the dataset's files at its root.
+func (a *App) downloadAndExtractZip(url, destDir string) error {
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp("", "dlss5-dataset-*.zip")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpName)
+
+	if err := downloadFile(url, tmpName); err != nil {
+		return err
+	}
+	return extractZip(tmpName, destDir)
+}
+
+// extractZip unpacks a zip archive into destDir, guarding against path
+// traversal (zip-slip) and creating directories as needed.
+func extractZip(zipPath, destDir string) error {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+
+	for _, f := range zr.File {
+		clean := filepath.Clean(filepath.Join(destDir, f.Name))
+		if !strings.HasPrefix(clean, filepath.Clean(destDir)+string(os.PathSeparator)) && clean != filepath.Clean(destDir) {
+			writeLog(fmt.Sprintf("extractZip: skipping unsafe entry %q (zip-slip)", f.Name))
+			continue
+		}
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(clean, 0755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(clean), 0755); err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(clean, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			rc.Close()
+			return err
+		}
+		if _, err := io.Copy(out, rc); err != nil {
+			out.Close()
+			rc.Close()
+			return err
+		}
+		out.Close()
+		rc.Close()
+	}
 	return nil
 }
 
@@ -817,6 +1136,16 @@ type GameDetails struct {
 	OptiScalerStatus  string      `json:"optiScalerStatus"`
 	IsInstalled       bool        `json:"isInstalled"`
 	DLLList           []DLLDetail `json:"dllList"`
+	GPUName           string        `json:"gpuName"`
+	NeuralSupport     bool          `json:"neuralSupport"`
+	NeuralNote        string        `json:"neuralNote"`
+	// NeuralNoteLevel is "info" for informational guidance (e.g. DX11 → use ReShade)
+	// or "warning" for hard limitations (e.g. NR unsupported on this GPU). Defaults
+	// to "warning" when empty.
+	NeuralNoteLevel string `json:"neuralNoteLevel"`
+	// CoverArt is the game's cover art. Either a Steam CDN URL, a local image data
+	// URI (base64), or empty when no art can be resolved.
+	CoverArt string `json:"coverArt"`
 }
 
 // PatchResult represents the result of a patch operation
@@ -887,6 +1216,14 @@ func isValidGameExe(exePath string) (bool, string) {
 	if isIgnoredExe(filepath.Base(exePath)) {
 		return false, ""
 	}
+	// Desktop/utility apps installed under Program Files (RustDesk, browsers, tools,
+	// etc.) register install locations in the Windows Uninstall registry. They are
+	// not games, so never validate them even though some import a graphics API.
+	lowerPath := strings.ToLower(exePath)
+	if strings.Contains(lowerPath, `\program files (x86)\`) ||
+		strings.Contains(lowerPath, `\program files\`) {
+		return false, ""
+	}
 	peFile, err := pe.Open(exePath)
 	if err != nil {
 		return false, ""
@@ -897,31 +1234,9 @@ func isValidGameExe(exePath string) (bool, string) {
 		return false, ""
 	}
 
-	libs, err := peFile.ImportedLibraries()
-	if err != nil {
-		return false, ""
-	}
-
-	for _, lib := range libs {
-		l := strings.ToLower(lib)
-		if strings.Contains(l, "vulkan-1.dll") {
-			return true, "vulkan"
-		}
-		if strings.Contains(l, "d3d12.dll") || strings.Contains(l, "dxgi.dll") {
-			return true, "dxgi"
-		}
-		if strings.Contains(l, "d3d11.dll") {
-			return true, "d3d11"
-		}
-		if strings.Contains(l, "d3d10.dll") {
-			return true, "d3d10"
-		}
-		if strings.Contains(l, "d3d9.dll") {
-			return true, "d3d9"
-		}
-		if strings.Contains(l, "opengl32.dll") {
-			return true, "opengl"
-		}
+	api := peImportedAPI(exePath)
+	if api != "" {
+		return true, api
 	}
 
 	return false, ""
@@ -1011,48 +1326,23 @@ func (a *App) hasApiImports(exePath string) struct {
 	}
 	defer peFile.Close()
 
-	libs, err := peFile.ImportedLibraries()
-	if err != nil {
-		return result
+	switch api := peImportedAPI(exePath); api {
+	case "d3d12":
+		result.api, result.label = "d3d12", "DirectX 12"
+	case "d3d11":
+		result.api, result.label = "d3d11", "DirectX 11"
+	case "vulkan":
+		result.api, result.label = "vulkan", "Vulkan"
+	case "d3d10":
+		result.api, result.label = "d3d10", "DirectX 10"
+	case "d3d9":
+		result.api, result.label = "d3d9", "DirectX 9"
+	case "opengl":
+		result.api, result.label = "opengl", "OpenGL"
+	case "dxgi":
+		result.api, result.label = "dxgi", "DXGI"
 	}
-	for _, lib := range libs {
-		l := strings.ToLower(lib)
-		switch {
-		case strings.Contains(l, "vulkan-1.dll") || strings.Contains(l, "vulkan"):
-			result = struct {
-				api   string
-				label string
-			}{api: "vulkan", label: "Vulkan"}
-		case strings.Contains(l, "d3d12.dll") || strings.Contains(l, "dxgi.dll"):
-			result = struct {
-				api   string
-				label string
-			}{api: "dxgi", label: "DirectX 12"}
-		case strings.Contains(l, "d3d11.dll"):
-			result = struct {
-				api   string
-				label string
-			}{api: "d3d11", label: "DirectX 11"}
-		case strings.Contains(l, "d3d10.dll"):
-			result = struct {
-				api   string
-				label string
-			}{api: "d3d10", label: "DirectX 10"}
-		case strings.Contains(l, "d3d9.dll"):
-			result = struct {
-				api   string
-				label string
-			}{api: "d3d9", label: "DirectX 9"}
-		case strings.Contains(l, "opengl32.dll"):
-			result = struct {
-				api   string
-				label string
-			}{api: "opengl", label: "OpenGL"}
-		}
-		if result.api != "" {
-			break
-		}
-	}
+
 	return result
 }
 
@@ -1354,7 +1644,193 @@ func getSteamLibraries() []string {
 	return libs
 }
 
-// getEpicManifestGames retrieves installed game directories from Epic Games Launcher manifests
+// steamAppsDirs returns every Steam "steamapps" directory on the system.
+// The Steam libraries are discovered via libraryfolders.vdf (getSteamLibraries
+// already yields their ...\steamapps\common paths; we map those up to steamapps).
+func steamAppsDirs() []string {
+	seen := make(map[string]bool)
+	var dirs []string
+	add := func(d string) {
+		d = filepath.Clean(d)
+		if d != "" {
+			k := strings.ToLower(d)
+			if !seen[k] {
+				seen[k] = true
+				dirs = append(dirs, d)
+			}
+		}
+	}
+	for _, common := range getSteamLibraries() {
+		// common = ...\steamapps\common  →  steamapps = parent
+		add(filepath.Dir(common))
+	}
+	// Also cover the main install location directly.
+	for _, p := range []string{
+		filepath.Join(os.Getenv("ProgramFiles(x86)"), "Steam"),
+		filepath.Join(os.Getenv("ProgramFiles"), "Steam"),
+	} {
+		add(filepath.Join(p, "steamapps"))
+	}
+	return dirs
+}
+
+// resolveSteamAppInfo finds the Steam app ID for a game folder by matching its name
+// against each appmanifest's "installdir". Returns the app ID and the steamapps dir
+// it was found in (empty if not a Steam game).
+func resolveSteamAppInfo(gameRoot string) (appID, steamapps string) {
+	folderName := strings.ToLower(filepath.Base(filepath.Clean(gameRoot)))
+	if folderName == "" {
+		return "", ""
+	}
+	for _, appsDir := range steamAppsDirs() {
+		manifests, err := filepath.Glob(filepath.Join(appsDir, "appmanifest_*.acf"))
+		if err != nil {
+			continue
+		}
+		for _, m := range manifests {
+			data, err := os.ReadFile(m)
+			if err != nil {
+				continue
+			}
+			content := string(data)
+			id := ""
+			installDir := ""
+			// Parse the two fields we need: "appid" and "installdir".
+			for _, line := range strings.Split(content, "\n") {
+				t := strings.TrimSpace(line)
+				if id == "" && strings.HasPrefix(t, "\"appid\"") {
+					parts := strings.Split(t, "\"")
+					if len(parts) >= 4 {
+						id = strings.TrimSpace(parts[3])
+					}
+				}
+				if strings.HasPrefix(t, "\"installdir\"") {
+					parts := strings.Split(t, "\"")
+					if len(parts) >= 4 {
+						installDir = strings.ToLower(strings.TrimSpace(parts[3]))
+					}
+				}
+			}
+			if installDir == folderName && id != "" {
+				return id, appsDir
+			}
+		}
+	}
+	return "", ""
+}
+
+// httpImageExists returns true if url responds successfully with an image (uses GET so it
+// works on servers that reject HEAD; the body download is short-circuited when possible).
+func httpImageExists(url string) bool {
+	client := &http.Client{Timeout: 8 * time.Second}
+	req, err := http.NewRequest(http.MethodHead, url, nil)
+	if err == nil {
+		resp, err := client.Do(req)
+		if err == nil {
+			good := resp.StatusCode == http.StatusOK
+			ct := resp.Header.Get("Content-Type")
+			if good && strings.HasPrefix(ct, "image/") {
+				resp.Body.Close()
+				return true
+			}
+			resp.Body.Close()
+		}
+	}
+	// Fall back to a lightweight GET for servers that don't support HEAD.
+	resp, err := http.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	ct := resp.Header.Get("Content-Type")
+	return strings.HasPrefix(ct, "image/")
+}
+
+// steamHeaderImage queries Steam's appdetails API and returns the game's live header/capsule
+// image URL. This is the reliable source for newer titles (e.g. Heartopia) whose art is not
+// exposed on the legacy steam/apps/<id>/ CDN paths.
+func steamHeaderImage(appID string) string {
+	apiURL := "https://store.steampowered.com/api/appdetails?appids=" + appID + "&l=english&cc=us"
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(apiURL)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var payload map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return ""
+	}
+	raw, ok := payload[appID]
+	if !ok {
+		return ""
+	}
+	var app struct {
+		Success bool `json:"success"`
+		Data    struct {
+			LibraryCapsule string `json:"library_capsule"`
+			CapsuleImage   string `json:"capsule_image"`
+			HeaderImage    string `json:"header_image"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &app); err != nil || !app.Success {
+		return ""
+	}
+	// Prefer a portrait capsule when available, otherwise the wide header.
+	if app.Data.LibraryCapsule != "" {
+		return app.Data.LibraryCapsule
+	}
+	if app.Data.CapsuleImage != "" {
+		return app.Data.CapsuleImage
+	}
+	return app.Data.HeaderImage
+}
+
+// resolveCoverArt returns cover art for a game: a local image data URI (from the Steam
+// librarycache, most reliable/offline) if present, otherwise a working Steam CDN URL.
+func resolveCoverArt(gameRoot string) string {
+	appID, steamapps := resolveSteamAppInfo(gameRoot)
+	if appID == "" {
+		return ""
+	}
+
+	// 1) Local Steam library cache is the most reliable and works offline.
+	candidates := []string{
+		filepath.Join(steamapps, "appcache", "librarycache", appID+"_library_600x900.jpg"),
+		filepath.Join(steamapps, "appcache", "librarycache", appID+"_header.jpg"),
+		filepath.Join(steamapps, "appcache", "librarycache", appID+".jpg"),
+	}
+	for _, c := range candidates {
+		if b, err := os.ReadFile(c); err == nil && len(b) > 0 {
+			mime := "image/jpeg"
+			if strings.HasSuffix(strings.ToLower(c), ".png") {
+				mime = "image/png"
+			}
+			return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(b)
+		}
+	}
+
+	// 2) Legacy portrait CDN path (works for most titles); only keep it if it resolves.
+	legacy := "https://cdn.cloudflare.steamstatic.com/steam/apps/" + appID + "/library_600x900.jpg"
+	if httpImageExists(legacy) {
+		return legacy
+	}
+
+	// 3) Steam appdetails API for the live art URL (handles newer games like Heartopia).
+	if u := steamHeaderImage(appID); u != "" {
+		return u
+	}
+
+	return legacy
+}
+
+
 func getEpicManifestGames() []string {
 	var paths []string
 	manifestDir := filepath.Join(os.Getenv("ProgramData"), "Epic", "EpicGamesLauncher", "Data", "Manifests")
@@ -1658,71 +2134,265 @@ func (a *App) checkDLSS5Installed(gamePath string) bool {
 	return false
 }
 
-// detectGameAPI detects the rendering API used by a game executable via fast PE headers & 2MB buffer scan
-func (a *App) detectGameAPI(exePath string) string {
-	writeLog("detectGameAPI: Analyzing executable " + exePath)
+// apiFromLibraryNames maps a set of imported library names to a rendering API code.
+// Priority matters: d3d11.dll is checked BEFORE dxgi.dll because DirectX 11 games also
+// import dxgi.dll (for the swapchain), so a DX11 title would otherwise be mislabeled as the
+// ambiguous "dxgi". d3d12.dll is a definitive DirectX 12 signal; dxgi.dll on its own stays
+// ambiguous (could be either D3D11 or D3D12).
+func apiFromLibraryName(lib string) string {
+	l := strings.ToLower(lib)
+	switch {
+	case strings.Contains(l, "d3d11.dll"):
+		return "d3d11"
+	case strings.Contains(l, "d3d12.dll"):
+		return "d3d12"
+	case strings.Contains(l, "vulkan-1.dll") || strings.Contains(l, "vulkan"):
+		return "vulkan"
+	case strings.Contains(l, "d3d10.dll"):
+		return "d3d10"
+	case strings.Contains(l, "d3d9.dll"):
+		return "d3d9"
+	case strings.Contains(l, "opengl32.dll"):
+		return "opengl"
+	case strings.Contains(l, "dxgi.dll"):
+		return "dxgi"
+	}
+	return ""
+}
 
-	if peFile, err := pe.Open(exePath); err == nil {
-		defer peFile.Close()
-		if libs, err := peFile.ImportedLibraries(); err == nil {
-			for _, lib := range libs {
-				l := strings.ToLower(lib)
-				if strings.Contains(l, "vulkan-1.dll") || strings.Contains(l, "vulkan") {
-					writeLog("detectGameAPI: Detected Vulkan API via PE import")
-					return "vulkan"
-				}
-				if strings.Contains(l, "d3d12.dll") || strings.Contains(l, "dxgi.dll") {
-					writeLog("detectGameAPI: Detected Direct3D 12 / DXGI API via PE import")
-					return "dxgi"
-				}
-				if strings.Contains(l, "d3d11.dll") {
-					writeLog("detectGameAPI: Detected Direct3D 11 API via PE import")
-					return "d3d11"
-				}
-				if strings.Contains(l, "d3d10.dll") {
-					writeLog("detectGameAPI: Detected Direct3D 10 API via PE import")
-					return "d3d10"
-				}
-				if strings.Contains(l, "d3d9.dll") {
-					writeLog("detectGameAPI: Detected Direct3D 9 API via PE import")
-					return "d3d9"
-				}
-				if strings.Contains(l, "opengl32.dll") {
-					writeLog("detectGameAPI: Detected OpenGL API via PE import")
-					return "opengl"
-				}
-			}
+// apiScore ranks API codes so the most advanced renderer wins when several DLLs
+// advertise different APIs (e.g. Control ships both a DX11 and a DX12 renderer DLL).
+func apiScore(api string) int {
+	switch api {
+	case "d3d12":
+		return 10
+	case "vulkan":
+		return 9
+	case "d3d11":
+		return 3
+	case "d3d10":
+		return 2
+	case "d3d9":
+		return 1
+	case "dxgi":
+		return 0
+	case "opengl":
+		return -1
+	}
+	return -2
+}
+
+// peImportSectionLocator maps an RVA to a file offset using the section headers.
+// Unlike debug/pe.ImportedLibraries (which skips sections whose PointerToRawData is 0
+// and so returns empty for many modern game binaries), this walks every section.
+func peRVAtoFileOffset(peFile *pe.File, rva uint32) (int64, bool) {
+	for _, s := range peFile.Sections {
+		if rva >= s.VirtualAddress && rva < s.VirtualAddress+s.Size {
+			off := int64(s.Offset) + int64(rva-s.VirtualAddress)
+			return off, true
 		}
+	}
+	return 0, false
+}
+
+// parsePEImportLibraries reads the PE import table manually and returns all imported
+// library names. debug/pe.ImportedLibraries() is unreliable on this toolchain (it returns
+// nothing for many stripped/large game executables because it skips sections whose raw
+// offset is 0), so we resolve the import directory and DLL name strings ourselves.
+func parsePEImportLibraries(exePath string) []string {
+	var libs []string
+
+	peFile, err := pe.Open(exePath)
+	if err != nil {
+		return libs
+	}
+	defer peFile.Close()
+
+	var idd pe.DataDirectory
+	switch oh := peFile.OptionalHeader.(type) {
+	case *pe.OptionalHeader64:
+		if oh.NumberOfRvaAndSizes <= uint32(pe.IMAGE_DIRECTORY_ENTRY_IMPORT) {
+			return libs
+		}
+		idd = oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_IMPORT]
+	case *pe.OptionalHeader32:
+		if oh.NumberOfRvaAndSizes <= uint32(pe.IMAGE_DIRECTORY_ENTRY_IMPORT) {
+			return libs
+		}
+		idd = oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_IMPORT]
+	default:
+		return libs
+	}
+
+	if idd.VirtualAddress == 0 {
+		return libs
 	}
 
 	f, err := os.Open(exePath)
 	if err != nil {
-		writeLog("detectGameAPI: Failed to open executable: " + err.Error())
-		return "dxgi"
+		return libs
 	}
 	defer f.Close()
 
-	buf := make([]byte, 2*1024*1024)
-	n, _ := f.Read(buf)
-	content := strings.ToLower(string(buf[:n]))
+	// The import directory is an array of IMAGE_IMPORT_DESCRIPTOR (20 bytes each),
+	// terminated by an all-zero entry.
+	const descriptorSize = 20
+	off, ok := peRVAtoFileOffset(peFile, idd.VirtualAddress)
+	if !ok {
+		return libs
+	}
 
-	if strings.Contains(content, "vulkan-1.dll") || strings.Contains(content, "vulkan") {
-		return "vulkan"
+	for i := 0; i < 128; i++ { // cap against runaway descriptors
+		descOff := off + int64(i*descriptorSize)
+		if _, err := f.Seek(descOff, io.SeekStart); err != nil {
+			break
+		}
+		desc := make([]byte, descriptorSize)
+		if _, err := io.ReadFull(f, desc); err != nil {
+			break
+		}
+		nameRVA := littleEndianUint32(desc[12:16]) // IMAGE_IMPORT_DESCRIPTOR.Name field
+		if nameRVA == 0 {
+			break
+		}
+		nameFileOff, ok := peRVAtoFileOffset(peFile, nameRVA)
+		if !ok {
+			// Name RVA did not resolve to a section with file data; skip this entry.
+			continue
+		}
+		if _, err := f.Seek(nameFileOff, io.SeekStart); err != nil {
+			continue
+		}
+		var nameBytes []byte
+		buf := make([]byte, 1)
+		for {
+			if _, err := io.ReadFull(f, buf); err != nil {
+				break
+			}
+			if buf[0] == 0 {
+				break
+			}
+			nameBytes = append(nameBytes, buf[0])
+			if len(nameBytes) > 256 {
+				break
+			}
+		}
+		if len(nameBytes) > 0 {
+			libs = append(libs, string(nameBytes))
+		}
 	}
-	if strings.Contains(content, "opengl32.dll") || strings.Contains(content, "opengl") {
-		return "opengl"
+	return libs
+}
+
+func littleEndianUint32(b []byte) uint32 {
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+}
+
+// peImportedAPI parses a PE's import table and returns the best recognized rendering API.
+func peImportedAPI(exePath string) string {
+	best := ""
+	bestScore := -2
+	for _, lib := range parsePEImportLibraries(exePath) {
+		if api := apiFromLibraryName(lib); api != "" {
+			if s := apiScore(api); s > bestScore {
+				best = api
+				bestScore = s
+			}
+		}
 	}
-	if strings.Contains(content, "d3d9.dll") {
-		return "d3d9"
+	return best
+}
+
+// detectSiblingDLLAPI inspects DLLs in the same directory as the executable. Some games
+// (e.g. Remedy's Control) keep their actual renderer in a companion DLL (d3d_rmdwin10_f.dll
+// imports d3d12.dll, d3d_rmdwin7_f.dll imports d3d11.dll) instead of the launcher exe, so the
+// exe import scan finds nothing. We scan a bounded set of sibling DLLs and keep the most
+// advanced renderer found.
+func detectSiblingDLLAPI(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
 	}
-	if strings.Contains(content, "d3d10.dll") {
-		return "d3d10"
+	best := ""
+	bestScore := -2
+	scanned := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := strings.ToLower(e.Name())
+		if !strings.HasSuffix(name, ".dll") {
+			continue
+		}
+		// Focus on likely renderer/engine DLLs, and cap the total scanned so big
+		// frameworks folders stay fast.
+		if scanned >= 60 {
+			break
+		}
+		scanned++
+		p := filepath.Join(dir, e.Name())
+		if api := peImportedAPI(p); api != "" {
+			if s := apiScore(api); s > bestScore {
+				best = api
+				bestScore = s
+			}
+		}
 	}
-	if strings.Contains(content, "d3d11.dll") {
-		return "d3d11"
+	return best
+}
+
+// detectGameAPI detects the rendering API used by a game executable via fast PE headers & 2MB buffer scan
+func (a *App) detectGameAPI(exePath string) string {
+	writeLog("detectGameAPI: Analyzing executable " + exePath)
+
+	if api := peImportedAPI(exePath); api != "" {
+		writeLog("detectGameAPI: Detected API " + api + " via PE import")
+		return api
 	}
-	if strings.Contains(content, "d3d12.dll") || strings.Contains(content, "dxgi.dll") {
-		return "dxgi"
+
+	f, err := os.Open(exePath)
+	if err == nil {
+		// Scan the WHOLE file (not just the first 2MB). The import name table that
+		// lists d3d11.dll / d3d12.dll sits deep inside large shipping binaries
+		// (e.g. a 93MB UE game keeps those strings at ~79MB), so a small prefix
+		// read misses them.
+		fi, _ := f.Stat()
+		var content string
+		if fi != nil && fi.Size() > 0 {
+			buf := make([]byte, fi.Size())
+			n, _ := io.ReadFull(f, buf)
+			content = strings.ToLower(string(buf[:n]))
+		}
+		f.Close()
+		if strings.Contains(content, "d3d11.dll") {
+			return "d3d11"
+		}
+		if strings.Contains(content, "d3d12.dll") {
+			return "d3d12"
+		}
+		if strings.Contains(content, "vulkan-1.dll") || strings.Contains(content, "vulkan") {
+			return "vulkan"
+		}
+		if strings.Contains(content, "d3d10.dll") {
+			return "d3d10"
+		}
+		if strings.Contains(content, "d3d9.dll") {
+			return "d3d9"
+		}
+		if strings.Contains(content, "opengl32.dll") {
+			return "opengl"
+		}
+		if strings.Contains(content, "dxgi.dll") {
+			return "dxgi"
+		}
+	} else {
+		writeLog("detectGameAPI: Failed to open executable: " + err.Error())
+	}
+
+	// Fallback: some games load their renderer from a companion DLL in the same folder.
+	if api := detectSiblingDLLAPI(filepath.Dir(exePath)); api != "" {
+		writeLog("detectGameAPI: Detected API " + api + " via sibling renderer DLL")
+		return api
 	}
 
 	writeLog("detectGameAPI: Defaulting to DXGI")
@@ -1758,6 +2428,7 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 
 	details.Name = filepath.Base(rootDir)
 	details.Path = rootDir
+	details.CoverArt = resolveCoverArt(rootDir)
 
 	if relExe, err := filepath.Rel(rootDir, targetExe); err == nil {
 		details.Executable = relExe
@@ -1766,8 +2437,13 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 	}
 
 	switch detectedAPI {
-	case "dxgi", "d3d12":
+	case "d3d12":
 		details.RenderingAPI = "DirectX 12"
+	case "dxgi":
+		// dxgi.dll is the swapchain/backbuffer layer used by BOTH DirectX 11 and
+		// DirectX 12 games, so labeling it "DirectX 12" is misleading (UE4
+		// titles commonly import dxgi+d3d12 yet run on D3D11). Show it neutrally.
+		details.RenderingAPI = "DXGI (DirectX 11/12)"
 	case "d3d11":
 		details.RenderingAPI = "DirectX 11"
 	case "d3d10":
@@ -1779,7 +2455,35 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 	case "opengl":
 		details.RenderingAPI = "OpenGL"
 	default:
-		details.RenderingAPI = "DirectX 12"
+		details.RenderingAPI = "DXGI (DirectX 11/12)"
+	}
+
+	// Neural-rendering support & guidance. DLSS NR runs only on RTX 40/50
+	// (the model rejects everything older), and OptiScaler's NR pass needs a
+	// DirectX 12 pipeline. Surface both so the UI can warn instead of mislead.
+	gpu := detectGPU()
+	details.GPUName = gpu.Name
+	switch gpu.NRTier {
+	case NRTierRTX40_50:
+		details.NeuralSupport = true
+		details.NeuralNote = ""
+	case NRTierRTX20_30:
+		details.NeuralSupport = false
+		details.NeuralNote = "Neural Rendering is not supported on this GPU (RTX 20-30). Only DLSS upscaling will be active."
+	default:
+		details.NeuralSupport = false
+		details.NeuralNote = "No supported NVIDIA GPU detected — DLSS Neural Rendering is unavailable. DLSS upscaling may still work."
+	}
+	if gpu.NRTier == NRTierRTX40_50 {
+		// Neural Rendering is supported; only guide the method choice. OptiScaler's
+		// Neural Rendering pass requires a DirectX 12 (or Vulkan) pipeline. Games that
+		// run on DirectX 11/10/9 or OpenGL cannot use it, so steer those to the ReShade
+		// method. This is informational (green), not a warning.
+		switch detectedAPI {
+		case "d3d11", "d3d10", "d3d9", "opengl":
+			details.NeuralNote = "This game runs on " + details.RenderingAPI + ". OptiScaler's Neural Rendering requires a DirectX 12 pipeline, so use the ReShade method for Neural Rendering here."
+			details.NeuralNoteLevel = "info"
+		}
 	}
 
 	details.IsInstalled = a.checkDLSS5Installed(rootDir)
@@ -2036,7 +2740,13 @@ func (a *App) InstallReshade(gamePath string) PatchResult {
 	}
 	native := a.gameHasNativeDLSS(gamePath)
 
-	reshadeSetup, setupErr := getReShadeSetup()
+	// Ensure all required data sets are complete (download from config URLs if
+	// needed) before proceeding.
+	if err := a.ensureAllDatasets(); err != nil {
+		return PatchResult{Success: false, Message: "Missing data. Please check the error dialog."}
+	}
+
+	reshadeSetup, setupErr := a.getReShadeSetup()
 	writeLog("InstallReshade: ReShade setup path: " + reshadeSetup)
 	writeLog(fmt.Sprintf("InstallReshade: Target EXE: %s in Directory: %s with API: %s", targetExe, targetDir, api))
 
@@ -2246,9 +2956,9 @@ func (a *App) copyReshadeFilesManually(targetDir string, api string, native bool
 		reshadeModuleName = "dxgi.dll"
 	}
 
-	extractedDLL := getAssetPath(filepath.Join("ReShade", "Extracted", "ReShade64.dll"))
+	extractedDLL := getAssetPath(filepath.Join("data", reshadeSetupDir, "Extracted", "ReShade64.dll"))
 	if _, err := os.Stat(extractedDLL); err != nil {
-		reshadeSetup, _ := getReShadeSetup()
+		reshadeSetup, _ := a.getReShadeSetup()
 		if _, statErr := os.Stat(reshadeSetup); statErr == nil {
 			extractReshadeDLL(reshadeSetup, filepath.Dir(extractedDLL))
 		}
@@ -2286,7 +2996,7 @@ func (a *App) copyEffects(targetDir string) error {
 
 	srcShaders := getAssetPath(filepath.Join("data", "reshade", "reshade-shaders-source"))
 	if _, err := os.Stat(srcShaders); err != nil {
-		srcShaders = getAssetPath(filepath.Join("ReShade", "Effects", "reshade-shaders"))
+		srcShaders = getAssetPath(filepath.Join("data", reshadeSetupDir, "Effects", "reshade-shaders"))
 	}
 
 	dstShaders := filepath.Join(targetDir, "reshade-shaders")
@@ -2326,6 +3036,13 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 	targetDir, _, _, _, err := a.resolveGameTarget(gamePath)
 	if err != nil {
 		return PatchResult{Success: false, Message: err.Error()}
+	}
+
+	// Ensure reshade + dlss5 data sets are complete before deploying files.
+	for _, label := range []string{"reshade", "dlss5"} {
+		if err := a.ensureDataset(label); err != nil {
+			return PatchResult{Success: false, Message: "Missing data. Please check the error dialog."}
+		}
 	}
 
 	srcPath := getAssetPath(filepath.Join("data", "reshade"))
@@ -2515,6 +3232,13 @@ func (a *App) InstallOptiScaler(gamePath string) PatchResult {
 		return PatchResult{Success: false, Message: err.Error()}
 	}
 
+	// Ensure optiscaler + dlss5 data sets are complete before deploying.
+	for _, label := range []string{"optiscaler", "dlss5"} {
+		if err := a.ensureDataset(label); err != nil {
+			return PatchResult{Success: false, Message: "Missing data. Please check the error dialog."}
+		}
+	}
+
 	srcPath := getAssetPath(filepath.Join("data", "optiscaler"))
 	dlss5Path := getAssetPath(filepath.Join("data", "dlss5"))
 	writeLog("InstallOptiScaler: OptiScaler source: " + srcPath + " | DLSS5 shared: " + dlss5Path + " -> Target: " + targetDir)
@@ -2522,8 +3246,8 @@ func (a *App) InstallOptiScaler(gamePath string) PatchResult {
 	// Detect GPU for automatic configuration
 	gpu := detectGPU()
 	isNvidia := strings.Contains(strings.ToLower(gpu.Name), "nvidia")
-	isRTX50 := gpu.SupportsNeuralRendering
-	writeLog(fmt.Sprintf("InstallOptiScaler: GPU='%s' nvidia=%v rtx50=%v", gpu.Name, isNvidia, isRTX50))
+	supportsNR := gpu.SupportsNeuralRendering
+	writeLog(fmt.Sprintf("InstallOptiScaler: GPU='%s' nvidia=%v supportsNR=%v tier=%q", gpu.Name, isNvidia, supportsNR, gpu.NRTier))
 
 	// Step 1: Create OptiScaler subdirectory in target
 	optiSubDir := filepath.Join(targetDir, "OptiScaler")
@@ -2538,6 +3262,7 @@ func (a *App) InstallOptiScaler(gamePath string) PatchResult {
 		"nvngx_dlss.dll",
 		"nvngx_dlssd.dll",
 		"nvngx_dlssg.dll",
+		"nvngx_deepdvc.dll",
 		"dlss-enabler-headless.dll",
 		"amd_fidelityfx_framegeneration_dx12.dll",
 		"amd_fidelityfx_upscaler_dx12.dll",
@@ -2578,36 +3303,42 @@ func (a *App) InstallOptiScaler(gamePath string) PatchResult {
 		writeLog("InstallOptiScaler: Copied OptiScaler.ini")
 
 		// Configure INI based on GPU
-		configureOptiScalerINI(iniDst, isNvidia, isRTX50)
+		configureOptiScalerINI(iniDst, isNvidia, supportsNR)
 	}
 
-	// Step 4: Copy NR forwarder as Nvngx_dlssr.dll (what OptiScaler v3 expects)
+	// Step 4: Deploy the Neural Rendering shim + model to the game ROOT dir
+	// (the folder holding dxgi.dll / the executable), exactly where OptiScaler
+	// DLSS-NR (build 433cc11 +) expects them: nvngx.dll_dlssnr.dll (shim) and
+	// nvngx_dlssnr.dll (model). The shim depends on the GPU tier:
+	//   - RTX 20-30: the full 158MB model shim (nvngx.dll_dlssnr_rtx20.dll)
+	//   - RTX 40-50 / modern RTX: the small 108KB forwarder shim (nvngx.dll_dlssnr.dll)
+	//   - non-NVIDIA / no NR: the 40-50 forwarder is still deployed but DlssNr is
+	//     disabled in the INI so nothing tries to run the pass.
 	nrShimSrc := filepath.Join(dlss5Path, "nvngx.dll_dlssnr.dll")
-	nrShimDst := filepath.Join(targetDir, "Nvngx_dlssr.dll")
+	if gpu.NRTier == NRTierRTX20_30 {
+		alt := filepath.Join(dlss5Path, "nvngx.dll_dlssnr_rtx20.dll")
+		if _, err := os.Stat(alt); err == nil {
+			nrShimSrc = alt
+		}
+	}
+	// Shim to game root as nvngx.dll_dlssnr.dll.
+	nrShimDst := filepath.Join(targetDir, "nvngx.dll_dlssnr.dll")
 	if _, err := os.Stat(nrShimSrc); err == nil {
 		_ = copyFile(nrShimSrc, nrShimDst)
-		writeLog("InstallOptiScaler: Copied NR forwarder as Nvngx_dlssr.dll")
+		writeLog(fmt.Sprintf("InstallOptiScaler: Copied NR shim %s as nvngx.dll_dlssnr.dll (tier %q)", filepath.Base(nrShimSrc), gpu.NRTier))
 	}
 
-	// Step 4b: Also copy original NR files to OptiScaler subdirectory
-	if _, err := os.Stat(nrShimSrc); err == nil {
-		_ = copyFile(nrShimSrc, filepath.Join(optiSubDir, "nvngx.dll_dlssnr.dll"))
-		writeLog("InstallOptiScaler: Copied nvngx.dll_dlssnr.dll to OptiScaler subdirectory")
-	}
-
-	// Step 5: Always copy NR model for OptiScaler — it handles its own
-	// fallback when the GPU does not support neural rendering.
+	// Model to game root as nvngx_dlssnr.dll. For the 40-50 tier the model is a
+	// separate 158MB file that the small shim loads; for the 20-30 tier the shim
+	// already IS the model, so we simply keep the same 158MB file in both roles.
 	nrSrc := filepath.Join(dlss5Path, "nvngx_dlssnr.dll")
-	nrDst := filepath.Join(targetDir, "Nvngx_dlssm.dll")
+	nrDst := filepath.Join(targetDir, "nvngx_dlssnr.dll")
 	if _, err := os.Stat(nrSrc); err == nil {
 		if err := copyFile(nrSrc, nrDst); err != nil {
-			writeLog("InstallOptiScaler: WARNING - Failed to copy NR model as Nvngx_dlssm.dll: " + err.Error())
+			writeLog("InstallOptiScaler: WARNING - Failed to copy NR model as nvngx_dlssnr.dll: " + err.Error())
 		} else {
-			writeLog("InstallOptiScaler: Copied NR model as Nvngx_dlssm.dll")
+			writeLog("InstallOptiScaler: Copied NR model as nvngx_dlssnr.dll")
 		}
-		// Also copy original NR model to OptiScaler subdirectory
-		_ = copyFile(nrSrc, filepath.Join(optiSubDir, "nvngx_dlssnr.dll"))
-		writeLog("InstallOptiScaler: Copied nvngx_dlssnr.dll to OptiScaler subdirectory")
 	} else {
 		writeLog("InstallOptiScaler: WARNING - nvngx_dlssnr.dll not found in " + dlss5Path)
 	}
@@ -2656,10 +3387,9 @@ func (a *App) InstallOptiScaler(gamePath string) PatchResult {
 		// Copy OptiScaler.ini and proxy dll to additional dirs
 		_ = copyFile(iniDst, filepath.Join(dir, "OptiScaler.ini"))
 		_ = copyFile(optiDst, filepath.Join(dir, "dxgi.dll"))
-		_ = copyFile(nrShimDst, filepath.Join(dir, "Nvngx_dlssr.dll"))
-		if isRTX50 {
-			_ = copyFile(filepath.Join(targetDir, "Nvngx_dlssm.dll"), filepath.Join(dir, "Nvngx_dlssm.dll"))
-		}
+		// NR shim + model to the hook dir root (same layout as the main target).
+		_ = copyFile(nrShimDst, filepath.Join(dir, "nvngx.dll_dlssnr.dll"))
+		_ = copyFile(nrDst, filepath.Join(dir, "nvngx_dlssnr.dll"))
 
 		// Create OptiScaler subdirectory and copy backends
 		dirOpti := filepath.Join(dir, "OptiScaler")
@@ -2680,7 +3410,7 @@ func (a *App) InstallOptiScaler(gamePath string) PatchResult {
 }
 
 // configureOptiScalerINI modifies OptiScaler.ini based on detected GPU
-func configureOptiScalerINI(iniPath string, isNvidia bool, isRTX50 bool) {
+func configureOptiScalerINI(iniPath string, isNvidia bool, supportsNR bool) {
 	data, err := os.ReadFile(iniPath)
 	if err != nil {
 		writeLog("configureOptiScalerINI: Failed to read INI: " + err.Error())
@@ -2689,27 +3419,26 @@ func configureOptiScalerINI(iniPath string, isNvidia bool, isRTX50 bool) {
 	content := string(data)
 
 	// Disable FPS overlay by default
-	content = strings.Replace(content, "ShowFps = true", "ShowFps = false", 1)
+	content = regexp.MustCompile(`(?m)^ShowFps\s*=\s*auto`).ReplaceAllString(content, "ShowFps=false")
 	writeLog("configureOptiScalerINI: FPS overlay disabled")
 
 	// Configure spoofing based on GPU vendor
 	if isNvidia {
-		content = strings.Replace(content, "Dxgi = auto", "Dxgi = false", 1)
+		content = regexp.MustCompile(`(?m)^Dxgi\s*=\s*auto`).ReplaceAllString(content, "Dxgi=false")
 		writeLog("configureOptiScalerINI: NVIDIA detected — Dxgi spoofing disabled")
 	} else {
-		content = strings.Replace(content, "Dxgi = auto", "Dxgi = true", 1)
+		content = regexp.MustCompile(`(?m)^Dxgi\s*=\s*auto`).ReplaceAllString(content, "Dxgi=true")
 		writeLog("configureOptiScalerINI: AMD/Intel detected — Dxgi spoofing enabled")
 	}
 
-	// Configure Neural Rendering based on GPU
-	if isRTX50 {
+	// Configure Neural Rendering based on GPU. Any RTX tier that can run NR
+	// (RTX 20-30 and RTX 40-50) gets DlssNr Enabled, otherwise it is disabled.
+	if supportsNR {
 		content = regexp.MustCompile(`(?m)(\[DlssNr\][\s\S]*?Enabled\s*=\s*)auto`).ReplaceAllString(content, "${1}true")
-		writeLog("configureOptiScalerINI: RTX 50 detected — DLSS 5 Neural Rendering enabled")
-	} else if !isNvidia {
-		content = regexp.MustCompile(`(?m)(\[DlssNr\][\s\S]*?Enabled\s*=\s*)auto`).ReplaceAllString(content, "${1}false")
-		writeLog("configureOptiScalerINI: Non-NVIDIA GPU — DLSS 5 Neural Rendering disabled")
+		writeLog("configureOptiScalerINI: RTX GPU detected — DLSS 5 Neural Rendering enabled")
 	} else {
-		writeLog("configureOptiScalerINI: NVIDIA GPU (detection inconclusive) — DLSS 5 Neural Rendering left as auto")
+		content = regexp.MustCompile(`(?m)(\[DlssNr\][\s\S]*?Enabled\s*=\s*)auto`).ReplaceAllString(content, "${1}false")
+		writeLog("configureOptiScalerINI: Non-RTX GPU — DLSS 5 Neural Rendering disabled")
 	}
 
 	if err := os.WriteFile(iniPath, []byte(content), 0644); err != nil {
@@ -2720,6 +3449,41 @@ func configureOptiScalerINI(iniPath string, isNvidia bool, isRTX50 bool) {
 // PatchGame performs the complete patch: ReShade + DLSS 5 or OptiScaler
 func (a *App) PatchGame(gamePath string) PatchResult {
 	return a.PatchGameWithMode(gamePath, "reshade")
+}
+
+// detectInstalledMode returns the mode currently installed on a game, or "" if
+// no patcher mode is detected. It uses the patcher's OWN deploy markers only,
+// so residual game-shipped files (ReShade.ini, reshade-shaders, dxgi.dll) never
+// trigger a false "mode installed" that would wrongly block a re-patch.
+func (a *App) detectInstalledMode(gamePath string) string {
+	targetDir, _, _, _, err := a.resolveGameTarget(gamePath)
+	if err != nil || targetDir == "" {
+		return ""
+	}
+	allDirs := a.findAllTargetDirs(gamePath)
+	// OptiScaler marker: OptiScaler.ini + its proxy dxgi.dll (same as
+	// checkDLSS5Installed). OptiScaler.ini alone is patcher-owned — games never
+	// ship it — so require the proxy too.
+	for _, dir := range allDirs {
+		if _, err := os.Stat(filepath.Join(dir, "OptiScaler.ini")); err == nil {
+			if _, err := os.Stat(filepath.Join(dir, "dxgi.dll")); err == nil {
+				return "optiscaler"
+			}
+		}
+	}
+	// ReShade markers must be patcher-owned add-on files. renodx-dlss5.addon64
+	// is always deployed by InstallDLSS5, so its presence proves the patcher's
+	// ReShade install is still in place (residual ReShade.ini / reshade-shaders
+	// from the game itself are NOT treated as "installed").
+	for _, dir := range allDirs {
+		if _, err := os.Stat(filepath.Join(dir, "renodx-dlss5.addon64")); err == nil {
+			return "reshade"
+		}
+		if _, err := os.Stat(filepath.Join(dir, "dlss5-feed.addon64")); err == nil {
+			return "reshade"
+		}
+	}
+	return ""
 }
 
 // PatchGameWithMode performs the complete patch using the selected mode ("reshade" or "optiscaler")
@@ -2743,6 +3507,21 @@ func (a *App) PatchGameWithMode(gamePath string, mode string) PatchResult {
 		return PatchResult{
 			Success: false,
 			Message: fmt.Sprintf("Game is currently running (%s). Please close the game first and try again.", procName),
+		}
+	}
+
+	// Block cross-mode repatching: if a different mode is already installed,
+	// the user must uninstall it first to avoid file conflicts.
+	existingMode := a.detectInstalledMode(gamePath)
+	if existingMode != "" && existingMode != mode {
+		label := "ReShade"
+		if existingMode == "optiscaler" {
+			label = "OptiScaler"
+		}
+		writeLog(fmt.Sprintf("PatchGameWithMode: BLOCKED - %s is already installed; uninstall %s before switching to %s", label, label, mode))
+		return PatchResult{
+			Success: false,
+			Message: fmt.Sprintf("%s is already installed on this game. Please uninstall it first before switching to a different patch method.", label),
 		}
 	}
 
@@ -2951,6 +3730,9 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 		"OptiScaler.ini",
 		"OptiScaler.log",
 		"nvngx.dll_dlssnr.dll",
+		"nvngx.dll_dlssnr_rtx20.dll",
+		"Nvngx_dlssr.dll",
+		"Nvngx_dlssm.dll",
 	}
 
 	// The DLSS 5 add-on / feed files are placed by this patcher and never
@@ -2964,6 +3746,24 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 		"dlss5-feed.log",
 		"renodx-dlss5.addon64",
 		"renodx-dlss5.addon32",
+	}
+
+	// ReShade-specific files and folders are treated as fully patcher/third
+	// party-owned and are purged clean on uninstall regardless of whether they
+	// pre-existed. Games do not ship these paths, so there is no risk of
+	// destroying a game's own file.
+	reshadeFilesOwned := map[string]bool{
+		"ReShade.ini":       true,
+		"ReShade.log":       true,
+		"ReShade.log1":      true,
+		"ReShadePreset.ini": true,
+		"ReShade.dll":       true,
+		"ReShade64.dll":     true,
+		"ReShade32.dll":     true,
+	}
+	reshadeFoldersOwned := map[string]bool{
+		"reshade-shaders": true,
+		"ReShade":         true,
 	}
 
 	foldersToRemove := []string{
@@ -2990,7 +3790,7 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 		}
 	}
 
-	reshadeSetup, _ := getReShadeSetup()
+	reshadeSetup, _ := a.getReShadeSetup()
 	var errors []string
 
 	for _, dir := range targetDirs {
@@ -3079,6 +3879,15 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 			if _, err := os.Stat(fPath); err != nil {
 				continue
 			}
+			// ReShade-specific files are always clean-uninstalled, ignoring the
+			// pre-existing / backup protection (they are patcher-owned paths).
+			if reshadeFilesOwned[file] {
+				writeLog(fmt.Sprintf("UninstallPatch: Removing ReShade file %s (clean uninstall)", fPath))
+				if err := cleanDLL(fPath); err != nil {
+					writeLog(fmt.Sprintf("UninstallPatch: Failed to remove %s: %v", fPath, err))
+				}
+				continue
+			}
 			if dirProtected[strings.ToLower(fPath)] || a.preExistingFiles[strings.ToLower(fPath)] {
 				continue
 			}
@@ -3091,6 +3900,12 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 		for _, folder := range foldersToRemove {
 			fPath := filepath.Join(dir, folder)
 			if _, err := os.Stat(fPath); err != nil {
+				continue
+			}
+			// ReShade folders are always clean-uninstalled too.
+			if reshadeFoldersOwned[folder] {
+				writeLog(fmt.Sprintf("UninstallPatch: Removing ReShade folder %s (clean uninstall)", fPath))
+				os.RemoveAll(fPath)
 				continue
 			}
 			if dirProtected[strings.ToLower(fPath)] || a.preExistingFiles[strings.ToLower(fPath)] {
@@ -3167,5 +3982,6 @@ func (a *App) GetSystemInfo() map[string]string {
 		"numCPU":        fmt.Sprintf("%d", goruntime.NumCPU()),
 		"gpu":           gpu.Name,
 		"neuralRender":  nrStatus,
+		"nrTier":        string(gpu.NRTier),
 	}
 }
