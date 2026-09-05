@@ -730,12 +730,44 @@
     box-shadow: 0 0 10px rgba(0, 255, 136, 0.5);
 }
 
+.patch-status-text {
+    margin-top: 8px;
+    font-size: 13px;
+    color: #8a8a8a;
+    text-align: center;
+    word-break: break-word;
+    line-height: 1.4;
+}
+
 .result {
     padding: 15px;
     border-radius: 6px;
     margin-top: 15px;
-    text-align: center;
+    text-align: left;
     font-weight: bold;
+    position: relative;
+}
+
+.result-text {
+    line-height: 1.5;
+}
+
+.result-close-btn {
+    position: absolute;
+    top: 6px;
+    right: 10px;
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.7;
+    padding: 0;
+}
+
+.result-close-btn:hover {
+    opacity: 1;
 }
 
 .result.success {

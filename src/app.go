@@ -32,8 +32,8 @@ var (
 	modole32 = syscall.NewLazyDLL("ole32.dll")
 
 	procCreateDXGIFactory1 = moddxgi.NewProc("CreateDXGIFactory1")
-	procCoInitializeEx    = modole32.NewProc("CoInitializeEx")
-	procCoUninitialize    = modole32.NewProc("CoUninitialize")
+	procCoInitializeEx     = modole32.NewProc("CoInitializeEx")
+	procCoUninitialize     = modole32.NewProc("CoUninitialize")
 )
 
 // {770AAE78-F26F-4DBA-A829-253C83D1B387} — IDXGIFactory1
@@ -42,16 +42,19 @@ var IID_IDXGIFactory1 = [16]byte{0x78, 0xae, 0x7a, 0x77, 0x6f, 0xf2, 0xba, 0x4d,
 // dxgiAdapterDesc1 mirrors the native DXGI_ADAPTER_DESC1 structure.
 // Field order MUST match the Windows SDK definition exactly.
 type dxgiAdapterDesc1 struct {
-	Description            [128]uint16 // WCHAR[128] — comes first
-	VendorID               uint32
-	DeviceID               uint32
-	SubSysID               uint32
-	Revision               uint32
-	DedicatedVideoMemory   uintptr // SIZE_T
-	DedicatedSystemMemory  uintptr // SIZE_T — was missing
-	SharedSystemMemory     uintptr // SIZE_T
-	AdapterLuid            struct{ LowPart uint32; HighPart int32 }
-	Flags                  uint32
+	Description           [128]uint16 // WCHAR[128] — comes first
+	VendorID              uint32
+	DeviceID              uint32
+	SubSysID              uint32
+	Revision              uint32
+	DedicatedVideoMemory  uintptr // SIZE_T
+	DedicatedSystemMemory uintptr // SIZE_T — was missing
+	SharedSystemMemory    uintptr // SIZE_T
+	AdapterLuid           struct {
+		LowPart  uint32
+		HighPart int32
+	}
+	Flags uint32
 }
 
 // vtableCall retrieves a COM vtable entry by index and calls it via syscall.SyscallN.
@@ -81,8 +84,8 @@ const (
 
 // gpuInfo holds detected GPU metadata.
 type gpuInfo struct {
-	Name                   string
-	SupportsNeuralRendering bool  // true when the GPU can run DLSS NR (RTX 20-50)
+	Name                    string
+	SupportsNeuralRendering bool   // true when the GPU can run DLSS NR (RTX 20-50)
 	Vendor                  string // "NVIDIA", "AMD", "Intel", "Virtual", ""
 	VRAM                    uint64 // dedicated video memory in bytes
 	NRTier                  NRTier // which neural-renderer shim this GPU needs
@@ -199,11 +202,11 @@ func detectGPUsUncached() []gpuInfo {
 					neural, tier = classifyNVIDIA(name)
 				}
 				info := gpuInfo{
-					Name:                   name,
+					Name:                    name,
 					SupportsNeuralRendering: neural,
-					Vendor:                 vendor,
-					VRAM:                   uint64(desc.DedicatedVideoMemory),
-					NRTier:                 tier,
+					Vendor:                  vendor,
+					VRAM:                    uint64(desc.DedicatedVideoMemory),
+					NRTier:                  tier,
 				}
 				if isVirtualAdapter(name) || vendor == "Virtual" {
 					virtual = append(virtual, info)
@@ -269,10 +272,10 @@ func detectGPUsFromRegistry() (real, virtual []gpuInfo) {
 			neural, tier = classifyNVIDIA(desc)
 		}
 		info := gpuInfo{
-			Name:                   desc,
+			Name:                    desc,
 			SupportsNeuralRendering: neural,
-			Vendor:                 vendor,
-			NRTier:                 tier,
+			Vendor:                  vendor,
+			NRTier:                  tier,
 		}
 		if isVirtualAdapter(desc) || vendor == "Virtual" {
 			virtual = append(virtual, info)
@@ -422,24 +425,24 @@ func writeAppConfig(cfg appConfig) error {
 
 // GpuInfo is the serializable GPU model returned to the frontend.
 type GpuInfo struct {
-	Name                   string `json:"name"`
+	Name                    string `json:"name"`
 	SupportsNeuralRendering bool   `json:"supportsNeuralRendering"`
-	Vendor                 string `json:"vendor"`
-	VRAM                   uint64 `json:"vram"`
-	Selected               bool   `json:"selected"`
-	Active                 bool   `json:"active"`
-	NRTier                 string `json:"nrTier"`
+	Vendor                  string `json:"vendor"`
+	VRAM                    uint64 `json:"vram"`
+	Selected                bool   `json:"selected"`
+	Active                  bool   `json:"active"`
+	NRTier                  string `json:"nrTier"`
 }
 
 func gpuToInfo(g gpuInfo, selected string, activeName string) GpuInfo {
 	return GpuInfo{
-		Name:                   g.Name,
+		Name:                    g.Name,
 		SupportsNeuralRendering: g.SupportsNeuralRendering,
-		Vendor:                 g.Vendor,
-		VRAM:                   g.VRAM,
-		Selected:               selected != "" && equalGPUName(g.Name, selected),
-		Active:                 equalGPUName(g.Name, activeName),
-		NRTier:                 string(g.NRTier),
+		Vendor:                  g.Vendor,
+		VRAM:                    g.VRAM,
+		Selected:                selected != "" && equalGPUName(g.Name, selected),
+		Active:                  equalGPUName(g.Name, activeName),
+		NRTier:                  string(g.NRTier),
 	}
 }
 
@@ -548,10 +551,10 @@ func getAssetPath(subPath string) string {
 }
 
 const (
-	configFile       = "config.json"
-	reshadeSetupDir  = "reshade-setup"
+	configFile        = "config.json"
+	reshadeSetupDir   = "reshade-setup"
 	defaultReShadeExe = "ReShade_Setup_6.8.0.exe"
-	reshadeAddonExe  = "ReShade_Setup_6.8.0_Addon.exe"
+	reshadeAddonExe   = "ReShade_Setup_6.8.0_Addon.exe"
 )
 
 // appConfig is the single consolidated configuration file (config.json). All
@@ -572,7 +575,7 @@ type appConfig struct {
 func defaultAppConfig() appConfig {
 	return appConfig{
 		GPUSelection:    "",
-		ReShadeSetupURL: "",
+		ReShadeSetupURL: "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe",
 		ReShadeURL:      "https://example.com/dlss5/reshade.zip",
 		OptiScalerURL:   "https://example.com/dlss5/optiscaler.zip",
 		DLSS5URL:        "https://example.com/dlss5/dlss5.zip",
@@ -602,26 +605,41 @@ func loadAppConfig() appConfig {
 	return cfg
 }
 
-// getReShadeSetup resolves the ReShade setup executable path. It first
-// guarantees the reshade-setup data set is complete (downloading from the
-// config URL if needed / erroring when the URL is empty), then returns the
-// bundled Addon build or the plain setup exe.
+// getReShadeSetup resolves the add-on enabled ReShade setup executable path
+// (ReShade_Setup_6.8.0_Addon.exe). A plain ReShade cannot load the DLSS 5
+// *.addon64 files ("limited add-on functionality"), so if the Addon build is
+// missing it is downloaded from the config URL and saved into
+// data/reshade-setup for reuse.
 func (a *App) getReShadeSetup() (string, error) {
 	setupDir := getAssetPath(filepath.Join("data", reshadeSetupDir))
-	// Ensure the setup data set is present before proceeding.
 	if err := a.ensureDataset("reshade-setup"); err != nil {
 		return "", err
 	}
-	candidates := []string{
-		filepath.Join(setupDir, reshadeAddonExe),
-		filepath.Join(setupDir, defaultReShadeExe),
+
+	addonPath := filepath.Join(setupDir, reshadeAddonExe)
+	if _, err := os.Stat(addonPath); err == nil {
+		return addonPath, nil
 	}
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c, nil
-		}
+
+	// Addon build missing → download it from the config URL and save it. The
+	// plain ReShade_Setup_6.8.0.exe (if present) is never used for the CLI
+	// because it installs a limited add-on build.
+	cfg := loadAppConfig()
+	url := strings.TrimSpace(cfg.ReShadeSetupURL)
+	if url == "" {
+		return "", fmt.Errorf("ReShade add-on setup (ReShade_Setup_6.8.0_Addon.exe) not found in %s and no reshade_setup_url is set", setupDir)
 	}
-	return "", fmt.Errorf("ReShade setup executable not found in %s", setupDir)
+	a.emitPatchStatus("Downloading ReShade add-on setup from config...")
+	writeLog("getReShadeSetup: downloading missing add-on setup from " + url)
+	if err := downloadFile(url, addonPath); err != nil {
+		return "", fmt.Errorf("failed to download ReShade add-on setup from %s: %v", url, err)
+	}
+	if _, err := os.Stat(addonPath); err != nil {
+		return "", fmt.Errorf("downloaded ReShade add-on setup not found at %s", addonPath)
+	}
+	writeLog("getReShadeSetup: add-on setup downloaded to " + addonPath)
+	a.ensureDataset("reshade-setup")
+	return addonPath, nil
 }
 
 // downloadFile downloads url into dest with a simple progress log.
@@ -666,10 +684,14 @@ type datasetSpec struct {
 }
 
 // requiredFilesFor returns the required relative files for a named dataset.
+// reshade-setup only requires the extracted hook DLL (used by the manual
+// fallback path); the setup exe is optional — if absent, the manual path
+// already has the DLL. Accepting either plain or add-on build exe is handled
+// by getReShadeSetup, not here.
 func requiredFilesFor(label string) []string {
 	switch label {
 	case "reshade-setup":
-		return []string{defaultReShadeExe, filepath.Join("Extracted", "ReShade64.dll")}
+		return []string{filepath.Join("Extracted", "ReShade64.dll")}
 	case "reshade":
 		return []string{
 			"renodx-dlss5.addon64",
@@ -758,11 +780,40 @@ func (a *App) ensureDataset(label string) error {
 		return err
 	}
 
-	writeLog(fmt.Sprintf("ensureDataset: '%s' incomplete at %s — downloading from %s", label, spec.dir, spec.url))
-	if err := a.downloadAndExtractZip(spec.url, spec.dir); err != nil {
-		err2 := fmt.Errorf("Failed to download data set '%s' from %s: %v", label, spec.url, err)
-		a.showConfigError(err2.Error())
-		return err2
+	// reshade-setup: if the URL points to a direct .exe download (not a zip
+	// archive), download the exe itself then extract the hook DLL from it using
+	// 7z. Other data sets always use zip archives.
+	if label == "reshade-setup" && strings.HasSuffix(strings.ToLower(spec.url), ".exe") {
+		writeLog(fmt.Sprintf("ensureDataset: '%s' downloading setup exe directly from %s", label, spec.url))
+		if err := os.MkdirAll(spec.dir, 0755); err != nil {
+			a.showConfigError(fmt.Sprintf("Failed to create directory for '%s': %v", label, err))
+			return err
+		}
+		exeDest := filepath.Join(spec.dir, filepath.Base(spec.url))
+		if err := downloadFile(spec.url, exeDest); err != nil {
+			err2 := fmt.Errorf("Failed to download '%s' from %s: %v", label, spec.url, err)
+			a.showConfigError(err2.Error())
+			return err2
+		}
+		// Extract ReShade64.dll (and ReShade32.dll) from the downloaded exe.
+		extractedDir := filepath.Join(spec.dir, "Extracted")
+		for _, dll := range []string{"ReShade64.dll", "ReShade32.dll"} {
+			if outErr := extractReshadeDLL(exeDest, extractedDir, dll); outErr != nil {
+				writeLog(fmt.Sprintf("ensureDataset: 7z extract %s: %v", dll, outErr))
+			}
+		}
+		// Copy manifest .json files next to the extracted DLLs for completeness.
+		for _, j := range []string{"ReShade64.json", "ReShade32.json", "ReShade64_XR.json", "ReShade32_XR.json"} {
+			cmd := exec.Command("7z", "x", exeDest, "-o"+extractedDir, j, "-y")
+			cmd.CombinedOutput()
+		}
+	} else {
+		writeLog(fmt.Sprintf("ensureDataset: '%s' incomplete at %s — downloading from %s", label, spec.dir, spec.url))
+		if err := a.downloadAndExtractZip(spec.url, spec.dir); err != nil {
+			err2 := fmt.Errorf("Failed to download data set '%s' from %s: %v", label, spec.url, err)
+			a.showConfigError(err2.Error())
+			return err2
+		}
 	}
 	if !dataComplete(spec.dir, spec.requiredFiles) {
 		err2 := fmt.Errorf("Downloaded archive for '%s' is still missing required files. The zip layout may not match expectations.", label)
@@ -1108,6 +1159,13 @@ func (a *App) emitEvent(name string, data ...interface{}) {
 	runtime.EventsEmit(a.ctx, name, data...)
 }
 
+// emitPatchStatus sends a live progress text line during patch/uninstall so
+// the frontend progress bar shows what the backend is currently doing.
+func (a *App) emitPatchStatus(msg string) {
+	writeLog("PatchStatus: " + msg)
+	a.emitEvent("patch:status", msg)
+}
+
 // GameInfo represents a detected game
 type GameInfo struct {
 	Name        string `json:"name"`
@@ -1126,19 +1184,19 @@ type DLLDetail struct {
 
 // GameDetails represents full status, version details, and DLL lists for UI
 type GameDetails struct {
-	Name              string      `json:"name"`
-	Path              string      `json:"path"`
-	Executable        string      `json:"executable"`
-	RenderingAPI      string      `json:"renderingAPI"`
-	DLSSVersion       string      `json:"dlssVersion"`
-	DLSS5Addon        string      `json:"dlss5Addon"`
-	ReshadeStatus     string      `json:"reshadeStatus"`
-	OptiScalerStatus  string      `json:"optiScalerStatus"`
-	IsInstalled       bool        `json:"isInstalled"`
-	DLLList           []DLLDetail `json:"dllList"`
-	GPUName           string        `json:"gpuName"`
-	NeuralSupport     bool          `json:"neuralSupport"`
-	NeuralNote        string        `json:"neuralNote"`
+	Name             string      `json:"name"`
+	Path             string      `json:"path"`
+	Executable       string      `json:"executable"`
+	RenderingAPI     string      `json:"renderingAPI"`
+	DLSSVersion      string      `json:"dlssVersion"`
+	DLSS5Addon       string      `json:"dlss5Addon"`
+	ReshadeStatus    string      `json:"reshadeStatus"`
+	OptiScalerStatus string      `json:"optiScalerStatus"`
+	IsInstalled      bool        `json:"isInstalled"`
+	DLLList          []DLLDetail `json:"dllList"`
+	GPUName          string      `json:"gpuName"`
+	NeuralSupport    bool        `json:"neuralSupport"`
+	NeuralNote       string      `json:"neuralNote"`
 	// NeuralNoteLevel is "info" for informational guidance (e.g. DX11 → use ReShade)
 	// or "warning" for hard limitations (e.g. NR unsupported on this GPU). Defaults
 	// to "warning" when empty.
@@ -1346,8 +1404,24 @@ func (a *App) hasApiImports(exePath string) struct {
 	return result
 }
 
-// getReshadeInfo probes a directory for a ReShade hook DLL and returns the
-// matched file name and a report of whether it supports add-ons
+// isAddonCapableReShade reports whether a ReShade hook DLL ships FULL add-on
+// support (*.addon64). The standard ReShade build has only "limited add-on
+// functionality": it still scans for *.addon64 but deliberately skips loading
+// them (see ReShade.log: "Skipped loading add-on from '%s' because this build
+// of ReShade has only limited add-on functionality"). Only the add-on build
+// ("*_Addon.exe" / the fused ReShade64.dll) actually loads them. The full
+// build contains the "Loading add-on from" loader strings and never contains
+// the "limited add-on functionality" message, which is the reliable marker.
+func isAddonCapableReShade(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(b, []byte("Loading add-on from")) && !bytes.Contains(b, []byte("limited add-on functionality"))
+}
+
+// getReshadeInfo probes a directory for an add-on-capable ReShade hook DLL and
+// returns the matched file name and a report of whether it supports add-ons
 func getReshadeInfo(dir string) (string, string, bool) {
 	hookCandidates := []string{"dxgi.dll", "d3d12.dll", "d3d11.dll", "d3d9.dll", "d3d10.dll", "opengl32.dll", "dinput8.dll"}
 	for _, name := range hookCandidates {
@@ -1356,18 +1430,14 @@ func getReshadeInfo(dir string) (string, string, bool) {
 			continue
 		}
 		ver := getDLLFileVersion(p)
-		support := false
-		if ver != "" {
-			if b, err := os.ReadFile(p); err == nil {
-				support = bytes.Contains(b, []byte("Searching for add-ons"))
-			}
-		}
-		// Only report as ReShade if the DLL actually contains ReShade code.
-		// Games may ship their own dxgi.dll / d3d12.dll that is NOT ReShade.
-		if !support {
+		// Only report as an add-on-capable ReShade hook if the DLL actually
+		// contains ReShade code AND can load .addon64 add-ons. Games may ship
+		// their own dxgi.dll / d3d12.dll (NOT ReShade), and the plain ReShade
+		// build lacks the add-on runtime, so neither counts as installed.
+		if ver == "" || !isAddonCapableReShade(p) {
 			continue
 		}
-		return p, ver, support
+		return p, ver, true
 	}
 	return "", "", false
 }
@@ -1829,7 +1899,6 @@ func resolveCoverArt(gameRoot string) string {
 
 	return legacy
 }
-
 
 func getEpicManifestGames() []string {
 	var paths []string
@@ -2475,13 +2544,13 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 		details.NeuralNote = "No supported NVIDIA GPU detected — DLSS Neural Rendering is unavailable. DLSS upscaling may still work."
 	}
 	if gpu.NRTier == NRTierRTX40_50 {
-		// Neural Rendering is supported; only guide the method choice. OptiScaler's
-		// Neural Rendering pass requires a DirectX 12 (or Vulkan) pipeline. Games that
-		// run on DirectX 11/10/9 or OpenGL cannot use it, so steer those to the ReShade
-		// method. This is informational (green), not a warning.
+		// Neural Rendering is supported; only guide the method choice. OptiScaler
+		// supports DirectX 12, DirectX 11 (via the D3D11On12 bridge) and Vulkan, so
+		// those can all run the NR pass. Only DX9/10 and OpenGL fall back to ReShade,
+		// since OptiScaler has no path for them. Informational (blue), not a warning.
 		switch detectedAPI {
-		case "d3d11", "d3d10", "d3d9", "opengl":
-			details.NeuralNote = "This game runs on " + details.RenderingAPI + ". OptiScaler's Neural Rendering requires a DirectX 12 pipeline, so use the ReShade method for Neural Rendering here."
+		case "d3d9", "d3d10", "opengl":
+			details.NeuralNote = "This game runs on " + details.RenderingAPI + ". OptiScaler does not support this API, so use the ReShade method for Neural Rendering here."
 			details.NeuralNoteLevel = "info"
 		}
 	}
@@ -2670,6 +2739,71 @@ func (a *App) installBackupDLL(dir, moduleName string) error {
 	return copyFile(existing, dst)
 }
 
+// isDXVKDLL reports whether the given DLL is a DXVK translator (a Direct3D 9 ->
+// Vulkan wrapper). DXVK embeds its name in the binary, so a case-insensitive
+// full-buffer scan is a reliable fingerprint.
+func isDXVKDLL(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	// Scan in chunks to avoid loading very large files fully into memory.
+	buf := make([]byte, 1<<20) // 1MB
+	const needle = "dxvk"
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			chunk := strings.ToLower(string(buf[:n]))
+			if strings.Contains(chunk, needle) {
+				return true
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return false
+}
+
+// backupAndRemoveDXVK detects a DXVK d3d9.dll in a game folder and moves it (plus
+// its shader cache/log) into the patcher backup so it cannot block a ReShade DX9
+// install. DXVK occupies the exact d3d9.dll name ReShade needs for DX9 games, so
+// the two cannot coexist. Non-DXVK d3d9.dll files (a game's own runtime, or a real
+// ReShade hook) are left untouched.
+func (a *App) backupAndRemoveDXVK(dir string) {
+	d3d9 := filepath.Join(dir, "d3d9.dll")
+	if st, err := os.Stat(d3d9); err != nil || st.IsDir() {
+		return
+	}
+	if !isDXVKDLL(d3d9) {
+		writeLog("backupAndRemoveDXVK: d3d9.dll present but not DXVK, leaving it")
+		return
+	}
+
+	backupDir := filepath.Join(dir, ".dlss5_backup", "dxvk_backup")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		writeLog("backupAndRemoveDXVK: failed to create backup dir: " + err.Error())
+		return
+	}
+	// Back up and then remove each DXVK artifact. copyFile returns nil for
+	// missing sources; here we only move files that exist.
+	toRemove := []string{"d3d9.dll", "d3d9.dxvk-cache", "d3d9.dxvk-log", "d3d9.log"}
+	for _, name := range toRemove {
+		src := filepath.Join(dir, name)
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
+		if err := copyFile(src, filepath.Join(backupDir, name)); err != nil {
+			writeLog("backupAndRemoveDXVK: backup failed for " + name + ": " + err.Error())
+			continue
+		}
+		_ = os.Remove(src)
+		writeLog("backupAndRemoveDXVK: backed up + removed " + name)
+	}
+	writeLog("backupAndRemoveDXVK: DXVK hook cleared from " + dir)
+}
+
 // gameHasNativeDLSS reports whether the game itself drives DLSS from its ACTIVE
 // rendering folder (the resolved shipping dir / launcher root). A stray copy of
 // nvngx_dlss.dll inside a third-party plugin folder (e.g.
@@ -2740,29 +2874,38 @@ func (a *App) InstallReshade(gamePath string) PatchResult {
 	}
 	native := a.gameHasNativeDLSS(gamePath)
 
+	// A DX9 game running through DXVK (d3d9.dll -> Vulkan) blocks ReShade's own
+	// d3d9 hook. If present, back it up and remove it so ReShade can install.
+	a.backupAndRemoveDXVK(targetDir)
+
+	a.emitPatchStatus("Preparing ReShade data files (download from config if needed)...")
 	// Ensure all required data sets are complete (download from config URLs if
 	// needed) before proceeding.
 	if err := a.ensureAllDatasets(); err != nil {
 		return PatchResult{Success: false, Message: "Missing data. Please check the error dialog."}
 	}
 
+	a.emitPatchStatus("Resolving ReShade add-on setup...")
 	reshadeSetup, setupErr := a.getReShadeSetup()
 	writeLog("InstallReshade: ReShade setup path: " + reshadeSetup)
 	writeLog(fmt.Sprintf("InstallReshade: Target EXE: %s in Directory: %s with API: %s", targetExe, targetDir, api))
 
-	// If the game already ships a ReShade hook DLL, prefer the working build so
-	// the player's existing ReShade (settings, preset, shader setup) is kept.
-	// We only need to make sure the preset, config and add-ons are in place.
+	// If the game already ships an add-on capable ReShade hook DLL, prefer the
+	// working build so the player's existing ReShade (settings, preset, shader
+	// setup) is kept. We only need to make sure the preset, config and add-ons
+	// are in place.
 	if hookFile, _, addonSupport := getReshadeInfo(targetDir); hookFile != "" {
 		writeLog("InstallReshade: Existing ReShade hook found at " + hookFile + " (add-on support: " + fmt.Sprintf("%v", addonSupport) + ") - skipping DLL replacement")
+		a.emitPatchStatus("Updating ReShade configuration (existing add-on build found)...")
 		a.ensureReshadeIni(targetDir, native)
 		a.ensureReshadePreset(targetDir, native)
 		a.copyEffects(targetDir)
 
 		if !addonSupport {
 			// The shipped ReShade has no add-on support; upgrade it to the
-			// bundled add-on build so DLSS 5 feed/renodx add-ons can load.
-			writeLog("InstallReshade: Existing ReShade lacks add-on support, replacing with bundled add-on build")
+			// add-on build so DLSS 5 feed/renodx add-ons can load.
+			writeLog("InstallReshade: Existing ReShade lacks add-on support, replacing with add-on build")
+			a.emitPatchStatus("Replacing ReShade with add-on enabled build...")
 			moduleName := "dxgi.dll"
 			switch api {
 			case "d3d11":
@@ -2772,7 +2915,7 @@ func (a *App) InstallReshade(gamePath string) PatchResult {
 			case "opengl":
 				moduleName = "opengl32.dll"
 			}
-			a.copyReshadeFilesManually(targetDir, api, native)
+			a.copyReshadeFilesManually(targetDir, targetExe, api, native)
 			_ = a.installBackupDLL(targetDir, moduleName)
 		}
 
@@ -2781,21 +2924,23 @@ func (a *App) InstallReshade(gamePath string) PatchResult {
 	}
 
 	if setupErr != nil {
-		writeLog("InstallReshade: ERROR resolving ReShade setup: " + setupErr.Error())
-		return a.copyReshadeFilesManually(targetDir, api, native)
+		writeLog("InstallReshade: ERROR resolving ReShade add-on setup: " + setupErr.Error())
+		return PatchResult{Success: false, Message: setupErr.Error()}
 	}
 
 	if _, err := os.Stat(reshadeSetup); os.IsNotExist(err) {
-		writeLog("InstallReshade: ERROR - ReShade setup not found at: " + reshadeSetup)
-		return a.copyReshadeFilesManually(targetDir, api, native)
+		writeLog("InstallReshade: ERROR - ReShade add-on setup not found at: " + reshadeSetup)
+		return PatchResult{Success: false, Message: "ReShade add-on setup not found at " + reshadeSetup}
 	}
 
-	writeLog("InstallReshade: Executing ReShade setup via CLI...")
+	a.emitPatchStatus("Running ReShade add-on installer (headless)...")
+	writeLog(fmt.Sprintf("InstallReshade: Executing ReShade setup via CLI... (%s)", api))
 	cmd := exec.Command(reshadeSetup,
 		targetExe,
 		"--headless",
 		"--api", api,
-		"--state", "finished",
+		"--preset", gamePath+"ReShadePreset.ini",
+		// "--state", "finished",
 	)
 	cmd.Dir = targetDir
 	output, err := cmd.CombinedOutput()
@@ -2820,13 +2965,25 @@ func (a *App) InstallReshade(gamePath string) PatchResult {
 	}
 
 	hookDLL := filepath.Join(targetDir, reshadeModuleName)
+	// Verify the CLI actually left an add-on-capable hook behind. The standard
+	// ReShade build only has "limited add-on functionality" and skips .addon64
+	// files (so the DLSS 5 add-ons never appear), so mere existence is not
+	// enough. If the add-on build is missing, replace it with the extracted
+	// ReShade64.dll from the add-on setup.
 	if _, statErr := os.Stat(hookDLL); statErr != nil {
-		writeLog("InstallReshade: Hook DLL not found after CLI setup. Falling back to manual copy.")
-		a.copyReshadeFilesManually(targetDir, api, native)
+		writeLog("InstallReshade: Hook DLL not created by CLI: " + statErr.Error())
+		return PatchResult{Success: false, Message: "ReShade installer did not create " + reshadeModuleName + ". Please check the log."}
+	}
+	if !isAddonCapableReShade(hookDLL) {
+		writeLog("InstallReshade: Hook DLL is not add-on capable; replacing with add-on ReShade64.dll")
+		a.emitPatchStatus("Replacing ReShade hook with add-on enabled build...")
+		a.copyReshadeFilesManually(targetDir, targetExe, api, native)
 	}
 
+	a.emitPatchStatus("Writing ReShade configuration & presets...")
 	a.ensureReshadeIni(targetDir, native)
 	a.ensureReshadePreset(targetDir, native)
+	a.emitPatchStatus("Copying ReShade shaders (iMMERSE / DLSS5 feed)...")
 	a.copyEffects(targetDir)
 
 	writeLog("InstallReshade: ReShade installation completed for " + targetDir)
@@ -2935,7 +3092,23 @@ PreprocessorDefinitions=DLSS5_MV_PROVIDER=2
 }
 
 // copyReshadeFilesManually copies ReShade files manually
-func (a *App) copyReshadeFilesManually(targetDir string, api string, native bool) PatchResult {
+// is32BitExe reports whether the given PE executable is a 32-bit (x86) build.
+// ReShade ships separate 32- and 64-bit hooks and a 32-bit game cannot load a
+// 64-bit DLL, so the correct hook must be chosen based on the game's bitness.
+func is32BitExe(exePath string) bool {
+	if exePath == "" {
+		return false
+	}
+	f, err := pe.Open(exePath)
+	if err != nil {
+		writeLog("is32BitExe: cannot open " + exePath + ": " + err.Error())
+		return false
+	}
+	defer f.Close()
+	return f.Machine == pe.IMAGE_FILE_MACHINE_I386
+}
+
+func (a *App) copyReshadeFilesManually(targetDir, targetExe, api string, native bool) PatchResult {
 	writeLog("copyReshadeFilesManually: Starting manual ReShade copy with API: " + api)
 
 	var reshadeModuleName string
@@ -2956,11 +3129,19 @@ func (a *App) copyReshadeFilesManually(targetDir string, api string, native bool
 		reshadeModuleName = "dxgi.dll"
 	}
 
-	extractedDLL := getAssetPath(filepath.Join("data", reshadeSetupDir, "Extracted", "ReShade64.dll"))
+	// Pick the 32- or 64-bit ReShade hook to match the game's architecture. A
+	// 64-bit hook silently fails to load in a 32-bit game (and vice versa).
+	dllName := "ReShade64.dll"
+	if is32BitExe(targetExe) {
+		dllName = "ReShade32.dll"
+	}
+	writeLog("copyReshadeFilesManually: Bitness of " + targetExe + ": " + dllName)
+
+	extractedDLL := getAssetPath(filepath.Join("data", reshadeSetupDir, "Extracted", dllName))
 	if _, err := os.Stat(extractedDLL); err != nil {
 		reshadeSetup, _ := a.getReShadeSetup()
 		if _, statErr := os.Stat(reshadeSetup); statErr == nil {
-			extractReshadeDLL(reshadeSetup, filepath.Dir(extractedDLL))
+			extractReshadeDLL(reshadeSetup, filepath.Dir(extractedDLL), dllName)
 		}
 	}
 
@@ -2980,9 +3161,10 @@ func (a *App) copyReshadeFilesManually(targetDir string, api string, native bool
 	return PatchResult{Success: true, Message: fmt.Sprintf("ReShade files copied manually (API: %s, Module: %s)", api, reshadeModuleName)}
 }
 
-// extractReshadeDLL extracts ReShade64.dll from the ReShade setup executable
-func extractReshadeDLL(setupPath, outputDir string) error {
-	cmd := exec.Command("7z", "x", setupPath, "-o"+outputDir, "ReShade64.dll", "-y")
+// extractReshadeDLL extracts a ReShade DLL (ReShade32/64.dll) from the ReShade
+// setup executable
+func extractReshadeDLL(setupPath, outputDir, dllName string) error {
+	cmd := exec.Command("7z", "x", setupPath, "-o"+outputDir, dllName, "-y")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("7z extraction failed: %v, output: %s", err, string(output))
@@ -3039,6 +3221,7 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 	}
 
 	// Ensure reshade + dlss5 data sets are complete before deploying files.
+	a.emitPatchStatus("Preparing DLSS 5 data files...")
 	for _, label := range []string{"reshade", "dlss5"} {
 		if err := a.ensureDataset(label); err != nil {
 			return PatchResult{Success: false, Message: "Missing data. Please check the error dialog."}
@@ -3054,6 +3237,11 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 	// that ship nvngx_dlss.dll so we do not race their NGX session.
 	native := a.gameHasNativeDLSS(gamePath)
 	writeLog(fmt.Sprintf("InstallDLSS5: native DLSS runtime in active dir: %v (mode: %s)", native, nativeModeLabel(native)))
+	if native {
+		a.emitPatchStatus("Native DLSS detected -> installing RenoDX add-on only (no feeder)...")
+	} else {
+		a.emitPatchStatus("No native DLSS -> installing RenoDX + DLSS5-Feed add-ons...")
+	}
 
 	// Detect GPU to decide whether neural rendering (nvngx_dlssnr.dll) is
 	// supported.  Only RTX 50 (Blackwell) series GPUs can run DLSSNR; on
@@ -3082,6 +3270,7 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 		filesToShipping = []string{"renodx-dlss5.addon64", "nvngx_dlssnr.dll"}
 	}
 
+	a.emitPatchStatus("Copying DLSS 5 add-on files to game folder...")
 	for _, file := range filesToShipping {
 		// Resolve source: check reshade-specific dir first, then shared dlss5 dir
 		src := filepath.Join(srcPath, file)
@@ -3123,6 +3312,7 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 		// Direct mode: no Feeder, keep the game's existing upscaler runtime.
 		addonFiles = []string{"renodx-dlss5.addon64", "nvngx_dlssnr.dll"}
 	}
+	a.emitPatchStatus("Spreading DLSS 5 add-ons to hook directories...")
 	for _, dir := range addonDirs {
 		if isSameOrChildDirectory(dir, targetDir) {
 			continue
@@ -3170,6 +3360,7 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 		}
 	}
 
+	a.emitPatchStatus("DLSS 5 add-ons installed.")
 	writeLog("InstallDLSS5: All DLSS 5 files installed successfully across target directories")
 	return PatchResult{Success: true, Message: "DLSS 5 files installed successfully"}
 }
@@ -3227,7 +3418,7 @@ func (a *App) InstallOptiScaler(gamePath string) PatchResult {
 		}
 	}
 
-	targetDir, _, _, _, err := a.resolveGameTarget(gamePath)
+	targetDir, _, _, detectedAPI, err := a.resolveGameTarget(gamePath)
 	if err != nil {
 		return PatchResult{Success: false, Message: err.Error()}
 	}
@@ -3302,8 +3493,8 @@ func (a *App) InstallOptiScaler(gamePath string) PatchResult {
 		}
 		writeLog("InstallOptiScaler: Copied OptiScaler.ini")
 
-		// Configure INI based on GPU
-		configureOptiScalerINI(iniDst, isNvidia, supportsNR)
+		// Configure INI based on GPU and detected API
+		configureOptiScalerINI(iniDst, isNvidia, supportsNR, detectedAPI)
 	}
 
 	// Step 4: Deploy the Neural Rendering shim + model to the game ROOT dir
@@ -3410,7 +3601,7 @@ func (a *App) InstallOptiScaler(gamePath string) PatchResult {
 }
 
 // configureOptiScalerINI modifies OptiScaler.ini based on detected GPU
-func configureOptiScalerINI(iniPath string, isNvidia bool, supportsNR bool) {
+func configureOptiScalerINI(iniPath string, isNvidia bool, supportsNR bool, detectedAPI string) {
 	data, err := os.ReadFile(iniPath)
 	if err != nil {
 		writeLog("configureOptiScalerINI: Failed to read INI: " + err.Error())
@@ -3429,6 +3620,15 @@ func configureOptiScalerINI(iniPath string, isNvidia bool, supportsNR bool) {
 	} else {
 		content = regexp.MustCompile(`(?m)^Dxgi\s*=\s*auto`).ReplaceAllString(content, "Dxgi=true")
 		writeLog("configureOptiScalerINI: AMD/Intel detected — Dxgi spoofing enabled")
+	}
+
+	// DirectX 11 games run through OptiScaler's D3D11On12 bridge. Force FSR 3.x
+	// upscaling (fsr31_12) on that path: it avoids the DLSS preset-override
+	// warning ("presets are overridden externally" from NVIDIA App / Inspector)
+	// that appears when DLSS is selected on a bridged DX11 title.
+	if detectedAPI == "d3d11" {
+		content = regexp.MustCompile(`(?m)^Dx11Upscaler\s*=\s*auto`).ReplaceAllString(content, "Dx11Upscaler=fsr31_12")
+		writeLog("configureOptiScalerINI: DX11 game detected — Dx11Upscaler forced to FSR 3.1 (D3D11On12)")
 	}
 
 	// Configure Neural Rendering based on GPU. Any RTX tier that can run NR
@@ -3526,6 +3726,7 @@ func (a *App) PatchGameWithMode(gamePath string, mode string) PatchResult {
 	}
 
 	writeLog("PatchGameWithMode: Step 1 - Backing up original files")
+	a.emitPatchStatus("Backing up original game files...")
 	backupResult := a.BackupOriginalFiles(gamePath)
 	if !backupResult.Success {
 		writeLog("PatchGameWithMode: Backup warning: " + backupResult.Message)
@@ -3795,6 +3996,7 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 
 	for _, dir := range targetDirs {
 		writeLog("UninstallPatch: Processing directory: " + dir)
+		a.emitPatchStatus("Processing folder: " + dir + "...")
 
 		if _, err := os.Stat(reshadeSetup); err == nil {
 			exes, _ := filepath.Glob(filepath.Join(dir, "*.exe"))
@@ -3803,6 +4005,7 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 					continue
 				}
 				writeLog(fmt.Sprintf("UninstallPatch: Running ReShade uninstaller for %s", exe))
+				a.emitPatchStatus("Running ReShade uninstaller for " + filepath.Base(exe) + "...")
 				cmd := exec.Command(reshadeSetup,
 					exe,
 					"--headless",
@@ -3823,10 +4026,16 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 			// A 0-file backup means the patcher never touched this folder;
 			// the files there belong to the game itself. Drop the marker and
 			// treat everything below as protected so they survive uninstall.
+			// Exception: nvngx_dlss.dll / nvngx_dlssnr.dll are deployed by
+			// this patcher. If nothing was backed up here, they cannot be the
+			// game's own — they are patcher leftovers and MUST be removed.
 			if data, err := os.ReadFile(filepath.Join(backupDir, "backup_info.txt")); err == nil {
 				if m := regexp.MustCompile(`Files backed up:\s*(\d+)`).FindStringSubmatch(string(data)); len(m) == 2 && m[1] == "0" {
 					writeLog("UninstallPatch: Empty backup detected at " + backupDir + ", removing marker only")
 					for _, name := range filesToRemove {
+						if name == "nvngx_dlss.dll" || name == "nvngx_dlssnr.dll" {
+							continue
+						}
 						dirProtected[strings.ToLower(filepath.Join(dir, name))] = true
 					}
 					for _, name := range foldersToRemove {
@@ -3842,6 +4051,7 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 
 			if hasBackup {
 				writeLog("UninstallPatch: Restoring backup from " + backupDir)
+				a.emitPatchStatus("Restoring original files from backup...")
 				entries, err := os.ReadDir(backupDir)
 				if err == nil {
 					for _, entry := range entries {
@@ -3863,6 +4073,7 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 
 		// Add-on files are patcher-owned, never shipped by games — purge them
 		// unconditionally in every target dir regardless of backup protection.
+		a.emitPatchStatus("Removing DLSS 5 add-on files...")
 		for _, addon := range addonFilesOwned {
 			addonPath := filepath.Join(dir, addon)
 			if _, err := os.Stat(addonPath); err != nil {
@@ -3874,6 +4085,7 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 			}
 		}
 
+		a.emitPatchStatus("Removing ReShade / DLSS 5 files...")
 		for _, file := range filesToRemove {
 			fPath := filepath.Join(dir, file)
 			if _, err := os.Stat(fPath); err != nil {
@@ -3929,6 +4141,7 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 	}
 
 	writeLog("=== UninstallPatch: Uninstall completed successfully ===")
+	a.emitPatchStatus("Uninstall completed.")
 	return PatchResult{Success: true, Message: "ReShade and DLSS 5 uninstalled successfully!"}
 }
 
@@ -3976,12 +4189,12 @@ func (a *App) GetSystemInfo() map[string]string {
 		nrStatus = "Yes"
 	}
 	return map[string]string{
-		"os":            goruntime.GOOS,
-		"arch":          goruntime.GOARCH,
-		"goVersion":     goruntime.Version(),
-		"numCPU":        fmt.Sprintf("%d", goruntime.NumCPU()),
-		"gpu":           gpu.Name,
-		"neuralRender":  nrStatus,
-		"nrTier":        string(gpu.NRTier),
+		"os":           goruntime.GOOS,
+		"arch":         goruntime.GOARCH,
+		"goVersion":    goruntime.Version(),
+		"numCPU":       fmt.Sprintf("%d", goruntime.NumCPU()),
+		"gpu":          gpu.Name,
+		"neuralRender": nrStatus,
+		"nrTier":       string(gpu.NRTier),
 	}
 }

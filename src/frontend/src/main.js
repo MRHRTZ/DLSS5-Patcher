@@ -68,8 +68,11 @@ document.querySelector('#app').innerHTML = `
           </div>
           <button id="patchBtn" class="btn btn-primary btn-large">Patch Game (Install ReShade + DLSS 5 Add-On)</button>
           <button id="uninstallBtn" class="btn btn-danger btn-large" style="display: none;">Uninstall Patch</button>
-          <div id="patchProgress" class="progress" style="display: none;">
-            <div class="progress-bar" id="progressBar"></div>
+          <div id="patchProgress" style="display: none;">
+            <div class="progress">
+              <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <div id="patchStatusText" class="patch-status-text"></div>
           </div>
           <div id="patchResult" class="result"></div>
         </div>
@@ -161,6 +164,14 @@ EventsOn('scan:complete', () => {
   }
 });
 
+// Live progress text from the backend during patch / uninstall
+EventsOn('patch:status', (msg) => {
+  const el = document.getElementById('patchStatusText');
+  if (el) {
+    el.textContent = msg && msg.trim() ? msg : '';
+  }
+});
+
 // Load games on startup sequentially with real-time UI updates
 async function loadGames() {
   games = [];
@@ -244,7 +255,12 @@ function renderGameList() {
 
 async function selectGame(game) {
   if (!game) return;
+  const previousPath = selectedGame ? selectedGame.path : null;
   selectedGame = normalizeGame(game);
+
+  if (!previousPath || previousPath.toLowerCase() !== selectedGame.path.toLowerCase()) {
+    clearResult();
+  }
 
   document.querySelectorAll('.game-item').forEach(item => {
     const index = parseInt(item.dataset.index);
@@ -405,6 +421,8 @@ async function handlePatch() {
   patchProgress.style.display = 'block';
   progressBar.style.width = '0%';
   patchResult.innerHTML = '';
+  const statusEl = document.getElementById('patchStatusText');
+  if (statusEl) statusEl.textContent = 'Starting patch...';
 
   let progress = 0;
   const progressInterval = setInterval(() => {
@@ -445,6 +463,7 @@ async function handlePatch() {
     updatePatchButton();
     setTimeout(() => {
       patchProgress.style.display = 'none';
+      if (statusEl) statusEl.textContent = '';
     }, 1000);
   }
 }
@@ -550,6 +569,8 @@ async function handleUninstall() {
   patchProgress.style.display = 'block';
   progressBar.style.width = '0%';
   patchResult.innerHTML = '';
+  const statusEl = document.getElementById('patchStatusText');
+  if (statusEl) statusEl.textContent = 'Starting uninstall...';
 
   let progress = 0;
   const progressInterval = setInterval(() => {
@@ -590,6 +611,7 @@ async function handleUninstall() {
     uninstallBtn.textContent = 'Uninstall Patch';
     setTimeout(() => {
       patchProgress.style.display = 'none';
+      if (statusEl) statusEl.textContent = '';
     }, 1000);
   }
 }
@@ -597,7 +619,26 @@ async function handleUninstall() {
 function showResult(type, message) {
   const patchResult = document.getElementById('patchResult');
   patchResult.className = `result ${type}`;
-  patchResult.innerHTML = message;
+  const escaped = escapeHtml(message);
+  patchResult.innerHTML = `
+    <button class="result-close-btn" aria-label="Close">&times;</button>
+    <div class="result-text">${escaped}</div>
+  `;
+  const closeBtn = patchResult.querySelector('.result-close-btn');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => {
+      patchResult.className = 'result';
+      patchResult.innerHTML = '';
+    });
+  }
+}
+
+function clearResult() {
+  const patchResult = document.getElementById('patchResult');
+  if (patchResult) {
+    patchResult.className = 'result';
+    patchResult.innerHTML = '';
+  }
 }
 
 function isRunningBlocked(message) {

@@ -1,7 +1,7 @@
 {
   "gpu_selection": "NVIDIA GeForce RTX 5070",
-  "reshade_setup_url": "",
-  "reshade_url": "https://example.com/dlss5/reshade.zip",
-  "optiscaler_url": "https://example.com/dlss5/optiscaler.zip",
-  "dlss5_url": "https://example.com/dlss5/dlss5.zip"
+  "reshade_setup_url": "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe",
+  "reshade_url": "",
+  "optiscaler_url": "",
+  "dlss5_url": ""
 }
