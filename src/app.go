@@ -4178,7 +4178,7 @@ func copyDir(src, dst string) error {
 
 // GetAppVersion returns the application version
 func (a *App) GetAppVersion() string {
-	return "1.0.0"
+	return "1.2.0"
 }
 
 // GetSystemInfo returns system information including detected GPU
