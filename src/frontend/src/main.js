@@ -1,11 +1,12 @@
 import './style.css';
 import './app.css';
-import { DetectGames, BrowseExe, GetGameFolderPreview, GetGameDetails, PatchGameWithMode, LaunchGame, GetAppVersion, UninstallPatch, KillGameProcess, GetGPUs, SelectGPU, RefreshGPUs } from '../wailsjs/go/main/App';
+import { DetectGames, BrowseExe, GetGameFolderPreview, GetGameDetails, GetGameDetailsForExe, ListGameExes, PatchGameWithMode, PatchGameWithModeForExe, LaunchGame, GetAppVersion, UninstallPatch, KillGameProcess, GetGPUs, SelectGPU, RefreshGPUs, GetDefenderStatus, AddDefenderExclusion, RemoveDefenderExclusion, IsPathExcluded, GetDownloadURLs, SaveDownloadURLs, VerifyInstall, VerifyInstallForExe, RepairInstall, RepairInstallForExe, OpenGameFolder } from '../wailsjs/go/main/App';
 import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime';
 
 document.querySelector('#app').innerHTML = `
   <div class="container">
     <header class="header">
+      <button id="settingsBtn" class="settings-btn" title="Settings" aria-label="Settings">⚙</button>
       <h1>DLSS 5 Patcher</h1>
       <div class="gpu-preview" id="gpuPreview">
         <span class="gpu-preview-label">GPU:</span>
@@ -66,8 +67,11 @@ document.querySelector('#app').innerHTML = `
               </button>
             </div>
           </div>
-          <button id="patchBtn" class="btn btn-primary btn-large">Patch Game (Install ReShade + DLSS 5 Add-On)</button>
-          <button id="uninstallBtn" class="btn btn-danger btn-large" style="display: none;">Uninstall Patch</button>
+          <div class="action-row">
+            <button id="patchBtn" class="btn btn-primary btn-large">Patch Game</button>
+            <button id="verifyBtn" class="btn btn-secondary btn-large" style="display: none;">Verify</button>
+            <button id="uninstallBtn" class="btn btn-danger btn-large" style="display: none;">Uninstall</button>
+          </div>
           <div id="patchProgress" style="display: none;">
             <div class="progress">
               <div class="progress-bar" id="progressBar"></div>
@@ -105,9 +109,73 @@ document.querySelector('#app').innerHTML = `
       </div>
     </div>
   </div>
+
+  <div id="settingsModal" class="modal-overlay" style="display: none;">
+    <div class="modal-container settings-container">
+      <div class="modal-header">
+        <h3 class="settings-title">⚙ Settings</h3>
+        <button id="settingsCloseBtn" class="modal-close-btn" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <h4 class="settings-section-title">Download URLs</h4>
+        <p class="settings-hint">Dataset zips are downloaded from these URLs when local files are missing. Leave a field empty to disable auto-download for it.</p>
+        <label class="settings-label">ReShade Setup (.exe)
+          <input type="text" id="urlReshadeSetup" class="settings-input" placeholder="https://..." spellcheck="false">
+        </label>
+        <label class="settings-label">ReShade shaders (.zip)
+          <input type="text" id="urlReshade" class="settings-input" placeholder="https://..." spellcheck="false">
+        </label>
+        <label class="settings-label">OptiScaler (.zip)
+          <input type="text" id="urlOptiscaler" class="settings-input" placeholder="https://..." spellcheck="false">
+        </label>
+        <label class="settings-label">DLSS 5 (.zip)
+          <input type="text" id="urlDlss5" class="settings-input" placeholder="https://..." spellcheck="false">
+        </label>
+        <label class="settings-label">dgVoodoo2 (.zip)
+          <input type="text" id="urlDgvoodoo" class="settings-input" placeholder="https://..." spellcheck="false">
+        </label>
+        <label class="settings-label">DLSS5-Feeder 32-bit (.zip)
+          <input type="text" id="urlFeeder" class="settings-input" placeholder="https://..." spellcheck="false">
+        </label>
+        <div class="settings-row settings-tight">
+          <label class="settings-label settings-inline-label" for="dgvoodooApi">dgVoodoo2 output</label>
+          <select id="dgvoodooApi" class="exe-select">
+            <option value="d3d11">Direct3D 11 (recommended)</option>
+            <option value="d3d12">Direct3D 12</option>
+          </select>
+        </div>
+        <p class="settings-hint">Bridge output for DX9 games — applies on the next patch (rewrites dgVoodoo.conf + matching ReShade hook).</p>
+        <div class="settings-row settings-tight">
+          <label class="settings-label settings-inline-label" for="neuralConsumer">Neural consumer</label>
+          <select id="neuralConsumer" class="exe-select">
+            <option value="renodx">RenoDX DLSS 5 (default)</option>
+            <option value="dfc">Deep Fried Chicken</option>
+          </select>
+        </div>
+        <p class="settings-hint">Which neural add-on to deploy — applies on the next patch (the other one is removed automatically).</p>
+        <div class="settings-row">
+          <button id="saveUrlsBtn" class="btn btn-primary btn-small">Save Settings</button>
+          <span id="urlsSaveResult" class="settings-result"></span>
+        </div>
+        <h4 class="settings-section-title">Windows Defender</h4>
+        <p class="settings-hint">dgVoodoo2 is often false-flagged by Defender and quarantined. Exclude the app folder (wherever you downloaded it) so datasets survive. A Windows permission prompt will appear — that is normal.</p>
+        <div class="settings-row">
+          <span id="defenderStatusText" class="settings-status">Checking...</span>
+        </div>
+        <div class="settings-row">
+          <code id="defenderAppDir" class="settings-path"></code>
+        </div>
+        <div class="settings-row">
+          <button id="excludeAppBtn" class="btn btn-primary btn-compact">Exclude App Folder</button>
+        </div>
+        <div id="defenderResult" class="settings-result"></div>
+      </div>
+    </div>
+  </div>
 `;
 
 let selectedGame = null;
+let exeChoiceByGame = {};
 let games = [];
 let isScanning = false;
 let searchQuery = '';
@@ -277,17 +345,38 @@ async function selectGame(game) {
   previewSection.style.display = 'block';
   folderContents.innerHTML = `<div class="loading">Loading component details...</div>`;
 
+  let gameDetails = null;
   try {
-    const details = await GetGameDetails(selectedGame.path || selectedGame.exePath);
-    
+    const choiceKey = (selectedGame.path || '').toLowerCase();
+    let availableExes = [];
+    try {
+      availableExes = await ListGameExes(selectedGame.path || selectedGame.exePath) || [];
+    } catch (e) {
+      console.error('Failed to list game exes:', e);
+    }
+    let manualExe = exeChoiceByGame[choiceKey] || '';
+    if (manualExe && !availableExes.some(e => ((e.path || e.Path) || '').toLowerCase() === manualExe.toLowerCase())) {
+      manualExe = '';
+      delete exeChoiceByGame[choiceKey];
+    }
+    const details = manualExe
+      ? await GetGameDetailsForExe(selectedGame.path, manualExe)
+      : await GetGameDetails(selectedGame.path || selectedGame.exePath);
+    gameDetails = details;
+
     if (details && details.isInstalled !== undefined) {
       selectedGame.isInstalled = !!details.isInstalled;
     }
 
-    // DirectX 11 games should prefer ReShade (OptiScaler's Neural Rendering
-    // needs DirectX 12). The backend flags this via neuralNote.
-    reshadeRecommended = !!(details.neuralNote && details.neuralNote.indexOf('ReShade method') !== -1);
+    // The backend explicitly flags APIs OptiScaler cannot handle (D3D8/D3D9/
+    // D3D10/OpenGL, where its proxy would never load); the old neuralNote
+    // heuristic stays as fallback.
+    reshadeRecommended = !!details.recommendsReShade ||
+      !!(details.neuralNote && details.neuralNote.indexOf('ReShade method') !== -1);
     applyRecommendedMode();
+
+    const currentExe = manualExe
+      || (((availableExes.find(e => !!(e.isTarget ?? e.IsTarget)) || {}).path) || ((availableExes[0] || {}).path) || '');
 
     const initial = (details.name || selectedGame.name || 'G').charAt(0).toUpperCase();
 
@@ -298,16 +387,30 @@ async function selectGame(game) {
             <div class="game-cover"><img class="game-cover-img" src="${details.coverArt}" alt="${details.name || selectedGame.name}" onerror="this.closest('.game-cover').remove();"></div>
           ` : `<div class="game-avatar">${initial}</div>`}
           <div class="game-title-group">
-            <h3 class="game-title">${details.name || selectedGame.name}</h3>
-            <div class="game-subtitle">Game folder:</div>
-            <div class="game-folder-path">${details.path || selectedGame.path}</div>
+            <h3 class="game-title">${details.name || selectedGame.name}<span class="bit-badge ${details.is32Bit ? 'bit32' : 'bit64'}">${details.is32Bit ? '32-bit' : '64-bit'}</span></h3>
+            <div class="game-subtitle">Game folder (click to open in Explorer):</div>
+            <div class="game-folder-path clickable" id="gameFolderPath" title="Open in Explorer">${details.path || selectedGame.path}</div>
           </div>
+          <button id="excludeGameBtn" class="btn btn-secondary btn-compact details-exclude-btn" title="Exclude this game's folder from Windows Defender so wrapper/hook files are not quarantined">🛡</button>
         </div>
 
         <div class="details-table">
           <div class="details-row">
             <span class="row-label">Executable</span>
-            <span class="row-value exe-value">${details.executable || selectedGame.exePath}</span>
+            ${availableExes.length > 1 ? `
+            <select id="exeSelect" class="exe-select" title="Target executable — change it if auto-detection picked the wrong one">
+              <option value="">Auto-detect (recommended)</option>
+              ${availableExes.map(e => {
+                const p = e.path || e.Path || '';
+                const nm = e.name || e.Name || p;
+                const api = ((e.api || e.API) || '').toUpperCase();
+                const sz = Number(e.size ?? e.Size ?? 0);
+                const sizeTxt = sz > 0 ? ' — ' + (sz / 1048576).toFixed(1) + ' MB' : '';
+                const isT = !!(e.isTarget ?? e.IsTarget);
+                const sel = (currentExe && p.toLowerCase() === currentExe.toLowerCase()) ? ' selected' : '';
+                return `<option value="${escapeHtml(p)}"${sel}>${escapeHtml(nm)}${sizeTxt}${api ? ' · ' + escapeHtml(api) : ''}${isT ? ' ★' : ''}</option>`;
+              }).join('')}
+            </select>` : `<span class="row-value exe-value">${details.executable || selectedGame.exePath}</span>`}
           </div>
           <div class="details-row">
             <span class="row-label">Rendering API</span>
@@ -319,7 +422,7 @@ async function selectGame(game) {
           </div>
           <div class="details-row">
             <span class="row-label">DLSS 5 add-on</span>
-            <span class="row-value ${details.dlss5Addon === 'Installed' ? 'status-green' : 'status-muted'}">${details.dlss5Addon || 'Not Installed'}</span>
+            <span class="row-value ${(details.dlss5Addon || '').indexOf('Installed') === 0 ? 'status-green' : 'status-muted'}">${details.dlss5Addon || 'Not Installed'}</span>
           </div>
           <div class="details-row">
             <span class="row-label">ReShade</span>
@@ -328,6 +431,10 @@ async function selectGame(game) {
           <div class="details-row">
             <span class="row-label">OptiScaler</span>
             <span class="row-value ${details.optiScalerStatus !== 'Not Installed' ? 'status-green' : 'status-muted'}">${details.optiScalerStatus || 'Not Installed'}</span>
+          </div>
+          <div class="details-row">
+            <span class="row-label">dgVoodoo2</span>
+            <span class="row-value ${details.dgvoodooStatus && details.dgvoodooStatus !== 'Not Installed' ? 'status-green' : 'status-muted'}">${details.dgvoodooStatus || 'Not Installed'}</span>
           </div>
           ${details.gpuName ? `
           <div class="details-row">
@@ -359,6 +466,18 @@ async function selectGame(game) {
         ` : ''}
       </div>
     `;
+
+    document.getElementById('exeSelect')?.addEventListener('change', (e) => {
+      if (!selectedGame || !selectedGame.path) return;
+      const k = selectedGame.path.toLowerCase();
+      if (e.target.value) exeChoiceByGame[k] = e.target.value;
+      else delete exeChoiceByGame[k];
+      selectGame(selectedGame);
+    });
+    // The header button is re-created on every render, so (re)attach here.
+    document.getElementById('excludeGameBtn')?.addEventListener('click', handleExcludeGame);
+    document.getElementById('gameFolderPath')?.addEventListener('click', handleOpenFolder);
+    updateExcludeBtnState();
   } catch (err) {
     console.error('Failed to get game details:', err);
     folderContents.innerHTML = `
@@ -371,11 +490,25 @@ async function selectGame(game) {
   document.getElementById('launchSection').style.display = 'block';
 
   const uninstallBtn = document.getElementById('uninstallBtn');
-  
-  if (selectedGame.isInstalled) {
+  const verifyBtn = document.getElementById('verifyBtn');
+
+  // Show Uninstall whenever patcher-owned files are present — not just on
+  // the DLSS marker. A ReShade/dgVoodoo-only state (e.g. after a skipped or
+  // failed DLSS step) must still be removable. Game-shipped "(built-in)"
+  // ReShade builds never count.
+  const rdStatus = (gameDetails && gameDetails.reshadeStatus) || '';
+  const isPatcherReshade = rdStatus.indexOf('Installed') === 0 && rdStatus.indexOf('built-in') === -1;
+  const isPatcherDgvoodoo = gameDetails && gameDetails.dgvoodooStatus && gameDetails.dgvoodooStatus !== 'Not Installed';
+  const canUninstall = selectedGame.isInstalled || isPatcherReshade || isPatcherDgvoodoo;
+  if (canUninstall) {
     uninstallBtn.style.display = 'block';
   } else {
     uninstallBtn.style.display = 'none';
+  }
+  // Verify is meaningful once patcher files exist; otherwise it only reports
+  // "not installed". Same visibility as Uninstall.
+  if (verifyBtn) {
+    verifyBtn.style.display = canUninstall ? 'block' : 'none';
   }
   updatePatchButton();
   document.getElementById('previewSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -432,7 +565,10 @@ async function handlePatch() {
   }, 200);
 
   try {
-    const result = await PatchGameWithMode(selectedGame.path, patchMode);
+    const manualExe = exeChoiceByGame[(selectedGame.path || '').toLowerCase()] || '';
+    const result = manualExe
+      ? await PatchGameWithModeForExe(selectedGame.path, patchMode, manualExe)
+      : await PatchGameWithMode(selectedGame.path, patchMode);
     clearInterval(progressInterval);
     progressBar.style.width = '100%';
 
@@ -469,7 +605,9 @@ async function handlePatch() {
 }
 
 async function handleLaunch() {
-  if (!selectedGame || !selectedGame.exePath) {
+  const manualExe = selectedGame && (exeChoiceByGame[(selectedGame.path || '').toLowerCase()] || '');
+  const launchPath = manualExe || (selectedGame && selectedGame.exePath) || '';
+  if (!selectedGame || !launchPath) {
     showResult('error', 'Game executable path not found');
     return;
   }
@@ -479,7 +617,7 @@ async function handleLaunch() {
   launchBtn.textContent = 'Launching...';
 
   try {
-    const result = await LaunchGame(selectedGame.exePath);
+    const result = await LaunchGame(launchPath);
     if (result.success || result.Success) {
       showResult('success', result.message || result.Message);
     } else {
@@ -493,8 +631,92 @@ async function handleLaunch() {
   }
 }
 
-function showConfirmModal({ title = 'Confirm Uninstall', bodyHtml = '', confirmText = 'Uninstall', cancelText = 'Cancel' } = {}) {
-  return new Promise((resolve) => {
+function renderVerifyReport(report) {
+  const checks = report.checks || report.Checks || [];
+  const autoFixed = report.autoFixed || report.AutoFixed || [];
+  const summary = report.summary || report.Summary || '';
+  const success = !!(report.success ?? report.Success);
+  const rows = checks.map((c) => {
+    const name = c.name || c.Name || '';
+    const status = c.status || c.Status || '';
+    const detail = c.detail || c.Detail || '';
+    const fix = c.fix || c.Fix || '';
+    const badge = status === 'ok' ? 'status-green' : (status === 'warn' ? 'status-warn' : 'status-red');
+    const glyph = status === 'ok' ? '[ OK ]' : (status === 'warn' ? '[WARN]' : '[FAIL]');
+    return `<div class="details-row"><span class="row-label ${badge}">${glyph}</span><span class="row-value"><strong>${escapeHtml(name)}</strong>${detail ? `<br><span class="status-muted">${escapeHtml(detail)}</span>` : ''}${fix ? `<br><span>→ ${escapeHtml(fix)}</span>` : ''}</span></div>`;
+  }).join('');
+  // NOTE: showResult() escapes everything via escapeHtml, so the check table
+  // must be rendered here directly — otherwise the HTML shows up as raw text.
+  const patchResult = document.getElementById('patchResult');
+  patchResult.className = `result ${success ? 'success' : 'error'}`;
+  patchResult.innerHTML = `
+    <button class="result-close-btn" aria-label="Close">&times;</button>
+    <div class="result-text">${escapeHtml(summary)}${autoFixed.length ? `<br>Auto-fixed: ${escapeHtml(autoFixed.join('; '))}` : ''}</div>
+    <div class="details-table verify-table" style="margin-top:8px;">${rows}</div>
+  `;
+  const closeBtn = patchResult.querySelector('.result-close-btn');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => {
+      patchResult.className = 'result';
+      patchResult.innerHTML = '';
+    });
+  }
+}
+
+async function handleVerify() {
+  if (!selectedGame || !selectedGame.path) {
+    showResult('error', 'Please select a game first');
+    return;
+  }
+  const btn = document.getElementById('verifyBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Verifying...'; }
+  try {
+    const manualExe = exeChoiceByGame[(selectedGame.path || '').toLowerCase()] || '';
+    const report = manualExe
+      ? await VerifyInstallForExe(selectedGame.path, manualExe)
+      : await VerifyInstall(selectedGame.path);
+    renderVerifyReport(report);
+    if (!(report.success ?? report.Success)) {
+      const fails = (report.checks || report.Checks || []).filter((c) => (c.status || c.Status) === 'fail');
+      const doRepair = await showConfirmModal({
+        title: '⚠️ Verify found failures',
+        bodyHtml: `<p>Verify found <strong>${fails.length} failing check(s)</strong>. Missing files can be repaired automatically (driver updates and similar user steps cannot).</p><p>Run <strong>Repair</strong> now?</p>`,
+        confirmText: 'Repair Now',
+        cancelText: 'Later'
+      });
+      if (doRepair) {
+        await handleRepair();
+      }
+    }
+  } catch (err) {
+    showResult('error', 'Verify failed: ' + err);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Verify'; }
+  }
+}
+
+async function handleRepair() {
+  if (!selectedGame || !selectedGame.path) {
+    showResult('error', 'Please select a game first');
+    return;
+  }
+  const btn = document.getElementById('verifyBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Repairing...'; }
+  try {
+    const manualExe = exeChoiceByGame[(selectedGame.path || '').toLowerCase()] || '';
+    const report = manualExe
+      ? await RepairInstallForExe(selectedGame.path, manualExe)
+      : await RepairInstall(selectedGame.path);
+    renderVerifyReport(report);
+    selectGame(selectedGame);
+  } catch (err) {
+    showResult('error', 'Repair failed: ' + err);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Verify'; }
+  }
+}
+
+function showConfirmModal({ title = 'Confirm Uninstall', bodyHtml = '', confirmText = 'Uninstall', cancelText = 'Cancel' } = {}) {  return new Promise((resolve) => {
     const modal = document.getElementById('customModal');
     const modalTitle = document.getElementById('modalTitle');
     const modalBody = document.getElementById('modalBody');
@@ -876,6 +1098,229 @@ async function refreshGpuBadge() {
   }
 }
 
+// ---- Settings: download URLs + Windows Defender ----
+
+function settingsModal() {
+  return document.getElementById('settingsModal');
+}
+
+async function openSettings() {
+  const modal = settingsModal();
+  if (!modal) return;
+  modal.style.display = 'flex';
+  await Promise.all([loadSettingsUrls(), refreshDefenderStatus()]);
+}
+
+function closeSettings() {
+  const modal = settingsModal();
+  if (modal) modal.style.display = 'none';
+}
+
+async function loadSettingsUrls() {
+  const fields = {
+    urlReshadeSetup: 'reshade_setup_url',
+    urlReshade: 'reshade_url',
+    urlOptiscaler: 'optiscaler_url',
+    urlDlss5: 'dlss5_url',
+    urlDgvoodoo: 'dgvoodoo_url',
+    urlFeeder: 'feeder_url'
+  };
+  try {
+    const urls = await GetDownloadURLs();
+    for (const [id, key] of Object.entries(fields)) {
+      const el = document.getElementById(id);
+      if (el) el.value = (urls && urls[key]) || '';
+    }
+    const apiEl = document.getElementById('dgvoodooApi');
+    if (apiEl) apiEl.value = (urls && urls.dgvoodoo_api === 'd3d12') ? 'd3d12' : 'd3d11';
+    const consumerEl = document.getElementById('neuralConsumer');
+    if (consumerEl) consumerEl.value = (urls && urls.neural_consumer === 'dfc') ? 'dfc' : 'renodx';
+  } catch (err) {
+    console.error('Failed to load download URLs:', err);
+  }
+}
+
+async function handleSaveUrls() {
+  const btn = document.getElementById('saveUrlsBtn');
+  const result = document.getElementById('urlsSaveResult');
+  const urls = {
+    reshade_setup_url: document.getElementById('urlReshadeSetup')?.value.trim() || '',
+    reshade_url: document.getElementById('urlReshade')?.value.trim() || '',
+    optiscaler_url: document.getElementById('urlOptiscaler')?.value.trim() || '',
+    dlss5_url: document.getElementById('urlDlss5')?.value.trim() || '',
+    dgvoodoo_url: document.getElementById('urlDgvoodoo')?.value.trim() || '',
+    dgvoodoo_api: document.getElementById('dgvoodooApi')?.value || 'd3d11',
+    neural_consumer: document.getElementById('neuralConsumer')?.value || 'renodx',
+    feeder_url: document.getElementById('urlFeeder')?.value.trim() || ''
+  };
+  if (btn) btn.disabled = true;
+  if (result) { result.className = 'settings-result'; result.textContent = 'Saving...'; }
+  try {
+    const res = await SaveDownloadURLs(urls);
+    if (result) {
+      const ok = res && (res.success || res.Success);
+      result.className = 'settings-result ' + (ok ? 'status-green-text' : 'status-red-text');
+      result.textContent = ok ? 'Saved.' : (res.message || res.Message || 'Save failed');
+    }
+  } catch (err) {
+    if (result) { result.className = 'settings-result status-red-text'; result.textContent = 'Save failed: ' + err; }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function refreshDefenderStatus() {
+  const statusEl = document.getElementById('defenderStatusText');
+  const dirEl = document.getElementById('defenderAppDir');
+  const resEl = document.getElementById('defenderResult');
+  if (resEl) { resEl.className = 'settings-result'; resEl.textContent = ''; }
+  try {
+    const st = await GetDefenderStatus();
+    if (!st) return null;
+    if (dirEl) dirEl.textContent = st.appDir || st.AppDir || '';
+    if (statusEl) {
+      const excluded = !!(st.excluded ?? st.Excluded);
+      const available = !!(st.available ?? st.Available);
+      const err = st.error || st.Error || '';
+      if (!available) {
+        statusEl.className = 'settings-status status-muted-text';
+        statusEl.textContent = '⚠ Defender status unreadable' + (err ? ' — ' + err : '');
+      } else if (excluded) {
+        statusEl.className = 'settings-status status-green-text';
+        statusEl.textContent = '✓ App folder is excluded from Defender';
+      } else {
+        statusEl.className = 'settings-status status-red-text';
+        statusEl.textContent = '✕ App folder is NOT excluded from Defender';
+      }
+    }
+    return st;
+  } catch (err) {
+    console.error('Failed to get Defender status:', err);
+    if (statusEl) { statusEl.className = 'settings-status status-muted-text'; statusEl.textContent = '⚠ Could not check Defender status'; }
+    return null;
+  }
+}
+
+async function handleExcludeApp() {
+  const btn = document.getElementById('excludeAppBtn');
+  const resEl = document.getElementById('defenderResult');
+  if (btn) { btn.disabled = true; btn.textContent = 'Requesting...'; }
+  if (resEl) { resEl.className = 'settings-result'; resEl.textContent = 'Waiting for the Windows permission prompt...'; }
+  try {
+    const st = await GetDefenderStatus();
+    const appDir = st && (st.appDir || st.AppDir);
+    if (!appDir) throw 'Could not resolve app folder';
+    const res = await AddDefenderExclusion(appDir);
+    const ok = res && (res.success || res.Success);
+    if (resEl) {
+      resEl.className = 'settings-result ' + (ok ? 'status-green-text' : 'status-red-text');
+      resEl.textContent = res.message || res.Message || (ok ? 'Excluded.' : 'Failed');
+    }
+    await refreshDefenderStatus();
+  } catch (err) {
+    if (resEl) { resEl.className = 'settings-result status-red-text'; resEl.textContent = 'Failed: ' + err; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Exclude App Folder'; }
+  }
+}
+
+// updateExcludeBtnState colors the header shield by exclusion state:
+// filled green = folder excluded, hollow gray = not excluded.
+async function updateExcludeBtnState() {
+  const btn = document.getElementById('excludeGameBtn');
+  if (!btn || !selectedGame || !selectedGame.path) return;
+  btn.textContent = '🛡';
+  btn.classList.remove('btn-excluded', 'btn-not-excluded');
+  try {
+    const excluded = await IsPathExcluded(selectedGame.path);
+    // The game may have been switched while awaiting; only style the current one.
+    if (!selectedGame || document.getElementById('excludeGameBtn') !== btn) return;
+    btn.classList.add(excluded ? 'btn-excluded' : 'btn-not-excluded');
+    btn.title = excluded
+      ? 'Game folder IS excluded from Defender — click to remove the exclusion'
+      : 'Game folder is NOT excluded from Defender — click to exclude it (wrapper/hook files may be quarantined)';
+  } catch (err) {
+    console.error('Failed to check exclusion state:', err);
+  }
+}
+
+async function handleOpenFolder() {
+  if (!selectedGame || !selectedGame.path) return;
+  try {
+    await OpenGameFolder(selectedGame.path);
+  } catch (err) {
+    showResult('error', 'Failed to open folder: ' + err);
+  }
+}
+
+async function handleExcludeGame() {
+  if (!selectedGame || !selectedGame.path) {
+    showResult('error', 'Please select a game first');
+    return;
+  }
+  const btn = document.getElementById('excludeGameBtn');
+  const patchResult = document.getElementById('patchResult');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
+  if (patchResult) { patchResult.className = 'result'; patchResult.textContent = 'Waiting for the Windows permission prompt...'; }
+  try {
+    const excluded = await IsPathExcluded(selectedGame.path);
+    const res = excluded
+      ? await RemoveDefenderExclusion(selectedGame.path)
+      : await AddDefenderExclusion(selectedGame.path);
+    if (res && (res.success || res.Success)) {
+      showResult('success', res.message || res.Message);
+    } else {
+      showResult('error', (res && (res.message || res.Message)) || 'Failed');
+    }
+  } catch (err) {
+    showResult('error', 'Failed: ' + err);
+  } finally {
+    if (btn) btn.disabled = false;
+    updateExcludeBtnState();
+  }
+}
+
+// On startup, if Defender is reachable but the app folder is not excluded,
+// offer a one-click exclusion dialog. Shown every launch until excluded.
+async function checkDefenderOnStartup() {
+  try {
+    const st = await GetDefenderStatus();
+    if (!st) return;
+    const excluded = !!(st.excluded ?? st.Excluded);
+    const available = !!(st.available ?? st.Available);
+    if (excluded || !available) return;
+    const appDir = st.appDir || st.AppDir || '';
+    const ok = await showConfirmModal({
+      title: '🛡 Windows Defender Exclusion',
+      bodyHtml: `
+        <p>The app folder is <strong>not excluded</strong> from Windows Defender. Files like dgVoodoo2 are often false-flagged and silently quarantined, which breaks patching.</p>
+        <p>Exclude it now in <strong>one click</strong>? (A Windows permission prompt will appear — that is normal.)</p>
+        <p class="settings-path">${escapeHtml(appDir)}</p>
+      `,
+      confirmText: 'Exclude Now',
+      cancelText: 'Later'
+    });
+    if (!ok) return;
+    try {
+      const res = await AddDefenderExclusion(appDir);
+      if (res && (res.success || res.Success)) {
+        openSettings();
+      } else {
+        await showConfirmModal({
+          title: 'Defender Exclusion Failed',
+          bodyHtml: `<p>${escapeHtml(res.message || res.Message || 'Unknown error')}</p><p>You can retry anytime from ⚙ Settings.</p>`,
+          confirmText: 'OK',
+          cancelText: 'Open Settings'
+        }).then((ack) => { if (!ack) openSettings(); });
+      }
+    } catch (err) {
+      console.error('Startup exclusion failed:', err);
+    }
+  } catch (err) {
+    console.error('Startup Defender check failed:', err);
+  }
+}
+
 // Event listeners
 async function handleRefresh() {
   const refreshBtn = document.getElementById('refreshBtn');
@@ -890,10 +1335,19 @@ async function handleRefresh() {
   }
 }
 
+document.getElementById('settingsBtn')?.addEventListener('click', openSettings);
+document.getElementById('settingsCloseBtn')?.addEventListener('click', closeSettings);
+document.getElementById('saveUrlsBtn')?.addEventListener('click', handleSaveUrls);
+document.getElementById('excludeAppBtn')?.addEventListener('click', handleExcludeApp);
+settingsModal()?.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'settingsModal') closeSettings();
+});
+
 document.getElementById('refreshBtn')?.addEventListener('click', handleRefresh);
 document.getElementById('browseBtn').addEventListener('click', handleBrowseExe);
 document.getElementById('patchBtn').addEventListener('click', handlePatch);
 document.getElementById('uninstallBtn').addEventListener('click', handleUninstall);
+document.getElementById('verifyBtn')?.addEventListener('click', handleVerify);
 document.getElementById('launchBtn').addEventListener('click', handleLaunch);
 
 // Mode toggle handlers
@@ -918,14 +1372,18 @@ function updatePatchButton() {
   const uninstallBtn = document.getElementById('uninstallBtn');
   if (patchMode === 'optiscaler') {
     patchBtn.textContent = selectedGame?.isInstalled
-      ? 'Re-Patch Game - OptiScaler (FSR/XeSS/DLSS)'
-      : 'Patch Game - Install OptiScaler (FSR/XeSS/DLSS)';
+      ? 'Re-Patch (OptiScaler)'
+      : 'Patch (OptiScaler)';
   } else {
     patchBtn.textContent = selectedGame?.isInstalled
-      ? 'Re-Patch Game - ReShade + DLSS 5 Add-On'
-      : 'Patch Game - Install ReShade + DLSS 5 Add-On';
+      ? 'Re-Patch (ReShade)'
+      : 'Patch (ReShade)';
   }
-  uninstallBtn.textContent = 'Uninstall Patch';
+  patchBtn.title = patchMode === 'optiscaler'
+    ? 'Install OptiScaler (FSR/XeSS/DLSS)'
+    : 'Install ReShade + DLSS 5 Add-On';
+  uninstallBtn.textContent = 'Uninstall';
+  uninstallBtn.title = 'Uninstall Patch';
 }
 document.getElementById('discordBtn').addEventListener('click', (e) => {
   e.preventDefault();
@@ -948,3 +1406,4 @@ loadGames();
 loadVersion();
 loadGpuInfo();
 setupGpuControls();
+checkDefenderOnStartup();

@@ -521,6 +521,11 @@ func closeLogger() {
 
 // getAssetPath resolves asset paths relative to executable or working directory
 func getAssetPath(subPath string) string {
+	// All asset lookups must converge on the single canonical data tree at
+	// the workspace root, no matter where the exe was launched from (root
+	// exe, src/build/bin exe, wails-dev temp exe, or go-test binary).
+	// Nearest levels are checked first; the extra depth only extends the
+	// reach so the workspace root is always found.
 	exePath, err := os.Executable()
 	if err == nil {
 		exeDir := filepath.Dir(exePath)
@@ -528,6 +533,7 @@ func getAssetPath(subPath string) string {
 			filepath.Join(exeDir, subPath),
 			filepath.Join(exeDir, "..", subPath),
 			filepath.Join(exeDir, "..", "..", subPath),
+			filepath.Join(exeDir, "..", "..", "..", subPath),
 		}
 		for _, c := range candidates {
 			if _, err := os.Stat(c); err == nil {
@@ -540,6 +546,7 @@ func getAssetPath(subPath string) string {
 		candidates := []string{
 			filepath.Join(cwd, subPath),
 			filepath.Join(cwd, "..", subPath),
+			filepath.Join(cwd, "..", "..", subPath),
 		}
 		for _, c := range candidates {
 			if _, err := os.Stat(c); err == nil {
@@ -567,6 +574,13 @@ type appConfig struct {
 	ReShadeURL      string `json:"reshade_url"`
 	OptiScalerURL   string `json:"optiscaler_url"`
 	DLSS5URL        string `json:"dlss5_url"`
+	DgVoodooURL     string `json:"dgvoodoo_url"`
+	DgVoodooAPI     string `json:"dgvoodoo_api"`
+	FeederURL       string `json:"feeder_url"`
+	// NeuralConsumer selects the neural consumer add-on: "renodx" (default,
+	// renodx-dlss5.addon64) or "dfc" (Deep Fried Chicken trio). Old configs
+	// without the field fall back to "renodx".
+	NeuralConsumer string `json:"neural_consumer"`
 }
 
 // defaultAppConfig returns the default config with dummy download URLs. Only
@@ -579,6 +593,10 @@ func defaultAppConfig() appConfig {
 		ReShadeURL:      "https://example.com/dlss5/reshade.zip",
 		OptiScalerURL:   "https://example.com/dlss5/optiscaler.zip",
 		DLSS5URL:        "https://example.com/dlss5/dlss5.zip",
+		DgVoodooURL:     "https://github.com/dege-diosg/dgVoodoo2/releases/download/v2.87.4/dgVoodoo2_87_4.zip",
+		DgVoodooAPI:     "d3d11",
+		FeederURL:       "https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/download/v0.13.1-beta.1/DLSS5-Feeder-0.13.1-beta.1.zip",
+		NeuralConsumer:  "renodx",
 	}
 }
 
@@ -602,6 +620,10 @@ func loadAppConfig() appConfig {
 	cfg.ReShadeURL = strings.TrimSpace(cfg.ReShadeURL)
 	cfg.OptiScalerURL = strings.TrimSpace(cfg.OptiScalerURL)
 	cfg.DLSS5URL = strings.TrimSpace(cfg.DLSS5URL)
+	cfg.DgVoodooURL = strings.TrimSpace(cfg.DgVoodooURL)
+	cfg.DgVoodooAPI = normalizeDgVoodooAPI(cfg.DgVoodooAPI)
+	cfg.FeederURL = strings.TrimSpace(cfg.FeederURL)
+	cfg.NeuralConsumer = normalizeNeuralConsumer(cfg.NeuralConsumer)
 	return cfg
 }
 
@@ -697,6 +719,10 @@ func requiredFilesFor(label string) []string {
 			"renodx-dlss5.addon64",
 			"dlss5-feed.addon64",
 			filepath.Join("reshade-shaders-source", "Shaders", "DLSS5_Feed.fx"),
+			// Per-consumer layout (either set satisfies completeness, see
+			// datasetComplete). Listed so a fresh setup shows both.
+			filepath.Join("renodx-dlss5", "renodx-dlss5.addon64"),
+			filepath.Join("deep-fried-chicken", "deep-fried-chicken.addon64"),
 		}
 	case "optiscaler":
 		return []string{
@@ -709,6 +735,20 @@ func requiredFilesFor(label string) []string {
 			"nvngx_dlss.dll",
 			"nvngx_dlssnr.dll",
 			"nvngx.dll_dlssnr.dll",
+		}
+	case "dgvoodoo":
+		// Official dgVoodoo2 zip nests the wrappers under MS/x86 and MS/x64.
+		return []string{
+			filepath.Join("MS", "x86", "D3D9.dll"),
+			filepath.Join("MS", "x64", "D3D9.dll"),
+			filepath.Join("MS", "x86", "D3D8.dll"),
+			filepath.Join("MS", "x64", "D3D8.dll"),
+		}
+	case "feeder":
+		// DLSS5-Feeder release zip: 32-bit add-on + 64-bit host helper.
+		return []string{
+			"dlss5-feed.addon32",
+			filepath.Join("host64", "dlss5-feed-host64.exe"),
 		}
 	}
 	return nil
@@ -730,6 +770,10 @@ func datasetFromConfig(cfg appConfig, label string) (datasetSpec, error) {
 		spec.url = cfg.OptiScalerURL
 	case "dlss5":
 		spec.url = cfg.DLSS5URL
+	case "dgvoodoo":
+		spec.url = cfg.DgVoodooURL
+	case "feeder":
+		spec.url = cfg.FeederURL
 	}
 	return spec, nil
 }
@@ -768,7 +812,7 @@ func (a *App) ensureDataset(label string) error {
 		a.showConfigError(err.Error())
 		return err
 	}
-	if dataComplete(spec.dir, spec.requiredFiles) {
+	if datasetComplete(label, spec) {
 		writeLog(fmt.Sprintf("ensureDataset: '%s' already complete at %s", label, spec.dir))
 		return nil
 	}
@@ -815,7 +859,7 @@ func (a *App) ensureDataset(label string) error {
 			return err2
 		}
 	}
-	if !dataComplete(spec.dir, spec.requiredFiles) {
+	if !datasetComplete(label, spec) {
 		err2 := fmt.Errorf("Downloaded archive for '%s' is still missing required files. The zip layout may not match expectations.", label)
 		a.showConfigError(err2.Error())
 		return err2
@@ -833,9 +877,43 @@ func configFieldFor(label string) string {
 		return "reshade_url"
 	case "optiscaler":
 		return "optiscaler_url"
+	case "dgvoodoo":
+		return "dgvoodoo_url"
+	case "feeder":
+		return "feeder_url"
 	default:
 		return "dlss5_url"
 	}
+}
+
+// datasetComplete reports whether a data set is usable. dgVoodoo2's official
+// zip nests wrappers under MS/x86 and MS/x64, but users may also drop the
+// wrapper DLLs in a flatter layout — accept any layout the dgVoodoo installer
+// can consume so a manual file drop is never rejected.
+func datasetComplete(label string, spec datasetSpec) bool {
+	if dataComplete(spec.dir, spec.requiredFiles) {
+		return true
+	}
+	if label == "dgvoodoo" {
+		for _, w := range []string{"D3D9.dll", "D3D8.dll"} {
+			if dgvoodooSourceDLL(true, w) != "" || dgvoodooSourceDLL(false, w) != "" {
+				return true
+			}
+		}
+	}
+	if label == "reshade" {
+		// Per-consumer layout: the feed add-on + shader are always required,
+		// plus EITHER consumer set (RenoDX or Deep Fried Chicken trio).
+		base := []string{
+			"dlss5-feed.addon64",
+			filepath.Join("reshade-shaders-source", "Shaders", "DLSS5_Feed.fx"),
+		}
+		if !dataComplete(spec.dir, base) {
+			return false
+		}
+		return consumerSetComplete(spec.dir, "renodx") || consumerSetComplete(spec.dir, "dfc")
+	}
+	return false
 }
 
 // ensureAllDatasets validates every downloadable data set is present before a
@@ -1192,6 +1270,11 @@ type GameDetails struct {
 	DLSS5Addon       string      `json:"dlss5Addon"`
 	ReshadeStatus    string      `json:"reshadeStatus"`
 	OptiScalerStatus string      `json:"optiScalerStatus"`
+	DgVoodooStatus   string      `json:"dgvoodooStatus"`
+	// RecommendsReShade is true when OptiScaler has no path for the game's
+	// API (D3D8/D3D9/D3D10/OpenGL), so the UI must default to ReShade mode.
+	RecommendsReShade bool `json:"recommendsReShade"`
+	Is32Bit          bool        `json:"is32Bit"`
 	IsInstalled      bool        `json:"isInstalled"`
 	DLLList          []DLLDetail `json:"dllList"`
 	GPUName          string      `json:"gpuName"`
@@ -1395,6 +1478,8 @@ func (a *App) hasApiImports(exePath string) struct {
 		result.api, result.label = "d3d10", "DirectX 10"
 	case "d3d9":
 		result.api, result.label = "d3d9", "DirectX 9"
+	case "d3d8":
+		result.api, result.label = "d3d8", "Direct3D 8"
 	case "opengl":
 		result.api, result.label = "opengl", "OpenGL"
 	case "dxgi":
@@ -1442,6 +1527,12 @@ func getReshadeInfo(dir string) (string, string, bool) {
 	return "", "", false
 }
 
+// fileExists reports whether path exists and is a regular file.
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}
+
 // cleanDLL applies a two-pass delete for a file that may be held open briefly
 // by anti-virus scanners or killed ReShade sessions
 func cleanDLL(path string) error {
@@ -1459,6 +1550,39 @@ func cleanDLL(path string) error {
 
 // resolveGameTarget finds the primary game executable and the actual target directory
 func (a *App) resolveGameTarget(gamePathOrExe string) (targetDir string, targetExe string, launchExe string, detectedAPI string, err error) {
+	return a.resolveGameTargetWithExe(gamePathOrExe, "")
+}
+
+// validPreferExe validates a user-picked executable override (from the game
+// preview picker). It must exist, be an .exe and not be a known
+// helper/uninstaller binary. Returns the absolute path or "" when unusable,
+// in which case callers silently fall back to auto-detection.
+func validPreferExe(preferExe string) string {
+	p := strings.TrimSpace(preferExe)
+	if p == "" {
+		return ""
+	}
+	st, err := os.Stat(p)
+	if err != nil || st.IsDir() {
+		return ""
+	}
+	if !strings.EqualFold(filepath.Ext(p), ".exe") {
+		return ""
+	}
+	if isIgnoredExe(filepath.Base(p)) {
+		return ""
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
+// resolveGameTargetWithExe is resolveGameTarget with an optional manual
+// executable override. When preferExe is valid it wins over every heuristic
+// (shipping patterns included) so a mis-detected game can be corrected from
+// the UI; otherwise detection behaves exactly as before.
+func (a *App) resolveGameTargetWithExe(gamePathOrExe string, preferExe string) (targetDir string, targetExe string, launchExe string, detectedAPI string, err error) {
 	if strings.TrimSpace(gamePathOrExe) == "" {
 		return "", "", "", "", fmt.Errorf("game path cannot be empty")
 	}
@@ -1479,6 +1603,21 @@ func (a *App) resolveGameTarget(gamePathOrExe string) (targetDir string, targetE
 	} else {
 		gameDir = filepath.Dir(cleanPath)
 		launchExe = cleanPath
+	}
+
+	// A manually picked executable always wins: skip every heuristic and
+	// target its folder directly (the API is still detected from it).
+	if forced := validPreferExe(preferExe); forced != "" {
+		targetExe = forced
+		targetDir = filepath.Dir(forced)
+		if launchExe == "" {
+			launchExe, _ = a.bestRootGameExe(gameDir)
+			if launchExe == "" {
+				launchExe = targetExe
+			}
+		}
+		detectedAPI = a.detectGameAPI(targetExe)
+		return targetDir, targetExe, launchExe, detectedAPI, nil
 	}
 
 	shippingPatterns := []string{
@@ -1541,6 +1680,109 @@ func (a *App) resolveGameTarget(gamePathOrExe string) (targetDir string, targetE
 
 	detectedAPI = a.detectGameAPI(targetExe)
 	return targetDir, targetExe, launchExe, detectedAPI, nil
+}
+
+// GameExeInfo describes one candidate game executable for the preview picker.
+type GameExeInfo struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Size     int64  `json:"size"`
+	API      string `json:"api"`
+	IsTarget bool   `json:"isTarget"`
+}
+
+// ListGameExes returns every candidate game executable under a game path
+// (root exes plus known shipping-binary locations), marking the one
+// auto-detection would patch. The preview shows a picker when there is more
+// than one so a mis-detected target can be corrected by hand.
+func (a *App) ListGameExes(gamePath string) []GameExeInfo {
+	cleanPath := filepath.Clean(strings.TrimSpace(gamePath))
+	if cleanPath == "" || cleanPath == "." {
+		return nil
+	}
+	var gameDir string
+	if st, err := os.Stat(cleanPath); err == nil {
+		if st.IsDir() {
+			gameDir = cleanPath
+		} else {
+			gameDir = filepath.Dir(cleanPath)
+		}
+	} else {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+	var paths []string
+	add := func(p string) {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			abs = p
+		}
+		key := strings.ToLower(abs)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		paths = append(paths, abs)
+	}
+
+	// Root-level executables (all of them — the user explicitly picks here,
+	// so even helper-looking binaries are listed).
+	if exes, _ := singleLevelExes(gameDir); exes != nil {
+		for _, e := range exes {
+			add(e)
+		}
+	}
+	// Known shipping-binary locations (UE, Battle.net, GOG layouts).
+	for _, pattern := range []string{
+		filepath.Join(gameDir, "*", "Binaries", "Win64", "*.exe"),
+		filepath.Join(gameDir, "Binaries", "Win64", "*.exe"),
+		filepath.Join(gameDir, "_retail_", "*.exe"),
+		filepath.Join(gameDir, "games", "*", "*.exe"),
+	} {
+		if matches, _ := filepath.Glob(pattern); matches != nil {
+			for _, m := range matches {
+				add(m)
+			}
+		}
+	}
+	// The file itself when a single exe was browsed.
+	if st, err := os.Stat(cleanPath); err == nil && !st.IsDir() && strings.EqualFold(filepath.Ext(cleanPath), ".exe") {
+		add(cleanPath)
+	}
+
+	_, autoTarget, _, _, _ := a.resolveGameTarget(gameDir)
+	autoKey := strings.ToLower(autoTarget)
+
+	infos := make([]GameExeInfo, 0, len(paths))
+	for _, p := range paths {
+		var size int64
+		if st, err := os.Stat(p); err == nil {
+			size = st.Size()
+		}
+		api := ""
+		if r := a.hasApiImports(p); r.api != "" {
+			api = r.api
+		}
+		rel := filepath.Base(p)
+		if r, err := filepath.Rel(gameDir, p); err == nil && !strings.HasPrefix(r, "..") {
+			rel = r
+		}
+		infos = append(infos, GameExeInfo{
+			Name:     rel,
+			Path:     p,
+			Size:     size,
+			API:      api,
+			IsTarget: autoTarget != "" && strings.ToLower(p) == autoKey,
+		})
+	}
+	sort.Slice(infos, func(i, j int) bool {
+		if infos[i].IsTarget != infos[j].IsTarget {
+			return infos[i].IsTarget
+		}
+		return infos[i].Size > infos[j].Size
+	})
+	return infos
 }
 
 // findAllTargetDirs finds all directories within a game path where binaries/DLLs could be located
@@ -1627,6 +1869,10 @@ func (a *App) findAllTargetDirs(gamePath string) []string {
 		lower := strings.ToLower(info.Name())
 		if strings.HasSuffix(lower, ".exe") ||
 			lower == "dxgi.dll" ||
+			lower == "d3d8.dll" ||
+			lower == "d3d9.dll" ||
+			lower == "dgvoodoo.conf" ||
+			lower == "dlss5-feed.addon32" ||
 			lower == "nvngx_dlss.dll" ||
 			lower == "nvngx_dlssnr.dll" ||
 			lower == "sl.dlss.dll" ||
@@ -2193,6 +2439,10 @@ func (a *App) checkDLSS5Installed(gamePath string) bool {
 		if _, err := os.Stat(filepath.Join(dir, "renodx-dlss5.addon64")); err == nil {
 			return true
 		}
+		// DLSS5-Feeder 32-bit route marker (lives beside the 32-bit hook).
+		if _, err := os.Stat(filepath.Join(dir, "dlss5-feed.addon32")); err == nil {
+			return true
+		}
 		// OptiScaler uses dxgi.dll proxy + OptiScaler.ini
 		if _, err := os.Stat(filepath.Join(dir, "OptiScaler.ini")); err == nil {
 			if _, err := os.Stat(filepath.Join(dir, "dxgi.dll")); err == nil {
@@ -2221,6 +2471,8 @@ func apiFromLibraryName(lib string) string {
 		return "d3d10"
 	case strings.Contains(l, "d3d9.dll"):
 		return "d3d9"
+	case strings.Contains(l, "d3d8.dll"):
+		return "d3d8"
 	case strings.Contains(l, "opengl32.dll"):
 		return "opengl"
 	case strings.Contains(l, "dxgi.dll"):
@@ -2243,6 +2495,8 @@ func apiScore(api string) int {
 		return 2
 	case "d3d9":
 		return 1
+	case "d3d8":
+		return 0
 	case "dxgi":
 		return 0
 	case "opengl":
@@ -2273,7 +2527,9 @@ func parsePEImportLibraries(exePath string) []string {
 
 	peFile, err := pe.Open(exePath)
 	if err != nil {
-		return libs
+		// Old/non-standard binaries (e.g. gta-vc.exe) fail pe.Open entirely —
+		// parse the headers by hand instead of giving up.
+		return parsePEImportLibrariesManual(exePath)
 	}
 	defer peFile.Close()
 
@@ -2357,6 +2613,167 @@ func littleEndianUint32(b []byte) uint32 {
 	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
 }
 
+// parsePEImportLibrariesManual is the pe.Open-free fallback for
+// parsePEImportLibraries: it walks the DOS/COFF/optional headers, the section
+// table (raw file offsets only — no string table, which is what breaks
+// debug/pe on old exes) and the import directory to collect DLL names.
+func parsePEImportLibrariesManual(exePath string) []string {
+	var libs []string
+	f, err := os.Open(exePath)
+	if err != nil {
+		return libs
+	}
+	defer f.Close()
+
+	readAt := func(off int64, n int) ([]byte, bool) {
+		buf := make([]byte, n)
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			return nil, false
+		}
+		if _, err := io.ReadFull(f, buf); err != nil {
+			return nil, false
+		}
+		return buf, true
+	}
+	dos, ok := readAt(0, 64)
+	if !ok || dos[0] != 'M' || dos[1] != 'Z' {
+		return libs
+	}
+	peOff := int64(littleEndianUint32(dos[0x3C:0x40]))
+	coff, ok := readAt(peOff, 24)
+	if !ok || coff[0] != 'P' || coff[1] != 'E' {
+		return libs
+	}
+	numSections := int(uint16(coff[6]) | uint16(coff[7])<<8)
+	sizeOpt := int(uint16(coff[20]) | uint16(coff[21])<<8)
+	optOff := peOff + 24
+	magic, ok := readAt(optOff, 2)
+	if !ok {
+		return libs
+	}
+	var impDirOff int64
+	switch uint16(magic[0]) | uint16(magic[1])<<8 {
+	case 0x10b: // PE32
+		impDirOff = optOff + 96 + 8
+	case 0x20b: // PE32+
+		impDirOff = optOff + 112 + 8
+	default:
+		return libs
+	}
+	// +8 skips DataDirectory[0] (export table); index 1 is the import table.
+	impDir, ok := readAt(impDirOff, 8)
+	if !ok {
+		return libs
+	}
+	impRVA := littleEndianUint32(impDir[0:4])
+	if impRVA == 0 {
+		return libs
+	}
+
+	type sect struct{ vaddr, vsize, raw, rawSize uint32 }
+	sections := make([]sect, 0, numSections)
+	secTabOff := optOff + int64(sizeOpt)
+	for i := 0; i < numSections; i++ {
+		sb, ok := readAt(secTabOff+int64(i*40), 40)
+		if !ok {
+			return libs
+		}
+		sections = append(sections, sect{
+			vsize:   littleEndianUint32(sb[8:12]),
+			vaddr:   littleEndianUint32(sb[12:16]),
+			rawSize: littleEndianUint32(sb[16:20]),
+			raw:     littleEndianUint32(sb[20:24]),
+		})
+	}
+	rvaToOff := func(rva uint32) (int64, bool) {
+		for _, s := range sections {
+			span := s.vsize
+			if s.rawSize > span {
+				span = s.rawSize
+			}
+			if span == 0 {
+				span = s.rawSize
+			}
+			if rva >= s.vaddr && rva < s.vaddr+span {
+				return int64(s.raw) + int64(rva-s.vaddr), true
+			}
+		}
+		return 0, false
+	}
+	readCString := func(off int64) string {
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			return ""
+		}
+		var nb []byte
+		one := make([]byte, 1)
+		for len(nb) < 260 {
+			if _, err := io.ReadFull(f, one); err != nil {
+				break
+			}
+			if one[0] == 0 {
+				break
+			}
+			nb = append(nb, one[0])
+		}
+		return string(nb)
+	}
+
+	descOff, ok := rvaToOff(impRVA)
+	if !ok {
+		return libs
+	}
+	for i := 0; i < 256; i++ {
+		desc, ok := readAt(descOff+int64(i*20), 20)
+		if !ok {
+			break
+		}
+		nameRVA := littleEndianUint32(desc[12:16])
+		if nameRVA == 0 {
+			break
+		}
+		nameOff, ok := rvaToOff(nameRVA)
+		if !ok {
+			continue
+		}
+		if name := readCString(nameOff); name != "" {
+			libs = append(libs, name)
+		}
+	}
+	return libs
+}
+
+// peMachineType reads the PE Machine field (0x14c = x86, 0x8664 = x64)
+// straight from the headers. Unlike debug/pe (which chokes on old,
+// non-standard executables such as gta-vc.exe with "offset 0 is before the
+// start of string table"), this only touches the DOS + COFF headers and
+// works on anything with a valid MZ/PE signature.
+func peMachineType(exePath string) (uint16, error) {
+	f, err := os.Open(exePath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	hdr := make([]byte, 64)
+	if _, err := io.ReadFull(f, hdr); err != nil {
+		return 0, err
+	}
+	if hdr[0] != 'M' || hdr[1] != 'Z' {
+		return 0, fmt.Errorf("not a PE image: missing MZ signature")
+	}
+	peOff := littleEndianUint32(hdr[0x3C:0x40])
+	if _, err := f.Seek(int64(peOff), io.SeekStart); err != nil {
+		return 0, err
+	}
+	sig := make([]byte, 6)
+	if _, err := io.ReadFull(f, sig); err != nil {
+		return 0, err
+	}
+	if sig[0] != 'P' || sig[1] != 'E' || sig[2] != 0 || sig[3] != 0 {
+		return 0, fmt.Errorf("not a PE image: missing PE signature")
+	}
+	return uint16(sig[4]) | uint16(sig[5])<<8, nil
+}
+
 // peImportedAPI parses a PE's import table and returns the best recognized rendering API.
 func peImportedAPI(exePath string) string {
 	best := ""
@@ -2433,26 +2850,37 @@ func (a *App) detectGameAPI(exePath string) string {
 			content = strings.ToLower(string(buf[:n]))
 		}
 		f.Close()
-		if strings.Contains(content, "d3d11.dll") {
-			return "d3d11"
+		// Fallback when the import table yields nothing: count API DLL name
+		// mentions instead of first-match. Old binaries can name several APIs
+		// (gta-vc.exe mentions d3d8.dll 3x and d3d9.dll 2x while importing
+		// only d3d8) — the most-mentioned one wins, ties go to the more
+		// advanced API.
+		bestAPI, bestCount, bestAPIPrio := "", 0, -3
+		for _, cand := range []struct {
+			sub string
+			api string
+		}{
+			{"d3d11.dll", "d3d11"},
+			{"d3d12.dll", "d3d12"},
+			{"vulkan-1.dll", "vulkan"},
+			{"d3d10.dll", "d3d10"},
+			{"d3d9.dll", "d3d9"},
+			{"d3d8.dll", "d3d8"},
+			{"opengl32.dll", "opengl"},
+			{"dxgi.dll", "dxgi"},
+		} {
+			n := strings.Count(content, cand.sub)
+			if n == 0 {
+				continue
+			}
+			prio := apiScore(cand.api)
+			if n > bestCount || (n == bestCount && prio > bestAPIPrio) {
+				bestAPI, bestCount, bestAPIPrio = cand.api, n, prio
+			}
 		}
-		if strings.Contains(content, "d3d12.dll") {
-			return "d3d12"
-		}
-		if strings.Contains(content, "vulkan-1.dll") || strings.Contains(content, "vulkan") {
-			return "vulkan"
-		}
-		if strings.Contains(content, "d3d10.dll") {
-			return "d3d10"
-		}
-		if strings.Contains(content, "d3d9.dll") {
-			return "d3d9"
-		}
-		if strings.Contains(content, "opengl32.dll") {
-			return "opengl"
-		}
-		if strings.Contains(content, "dxgi.dll") {
-			return "dxgi"
+		if bestAPI != "" {
+			writeLog(fmt.Sprintf("detectGameAPI: Detected API %s via string scan (%d mentions)", bestAPI, bestCount))
+			return bestAPI
 		}
 	} else {
 		writeLog("detectGameAPI: Failed to open executable: " + err.Error())
@@ -2470,11 +2898,22 @@ func (a *App) detectGameAPI(exePath string) string {
 
 // GetGameDetails analyzes game files and returns complete component versions, API, and DLL list
 func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
+	return a.getGameDetailsWithExe(gamePathOrExe, "")
+}
+
+// GetGameDetailsForExe is GetGameDetails with a manually picked target
+// executable (from the preview picker); an invalid exe falls back to auto.
+func (a *App) GetGameDetailsForExe(gamePath string, exePath string) GameDetails {
+	return a.getGameDetailsWithExe(gamePath, exePath)
+}
+
+func (a *App) getGameDetailsWithExe(gamePathOrExe string, preferExe string) GameDetails {
 	details := GameDetails{
 		DLSSVersion:      "Not Available",
 		DLSS5Addon:       "Not Installed",
 		ReshadeStatus:    "Not Installed",
 		OptiScalerStatus: "Not Installed",
+		DgVoodooStatus:   "Not Installed",
 		DLLList:          []DLLDetail{},
 	}
 
@@ -2482,7 +2921,7 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 		return details
 	}
 
-	targetDir, targetExe, _, detectedAPI, err := a.resolveGameTarget(gamePathOrExe)
+	targetDir, targetExe, _, detectedAPI, err := a.resolveGameTargetWithExe(gamePathOrExe, preferExe)
 	if err != nil || targetExe == "" {
 		return details
 	}
@@ -2504,6 +2943,7 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 	} else {
 		details.Executable = targetExe
 	}
+	details.Is32Bit = is32BitExe(targetExe)
 
 	switch detectedAPI {
 	case "d3d12":
@@ -2519,6 +2959,8 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 		details.RenderingAPI = "DirectX 10"
 	case "d3d9":
 		details.RenderingAPI = "Direct3D 9"
+	case "d3d8":
+		details.RenderingAPI = "Direct3D 8"
 	case "vulkan":
 		details.RenderingAPI = "Vulkan"
 	case "opengl":
@@ -2548,11 +2990,27 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 		// supports DirectX 12, DirectX 11 (via the D3D11On12 bridge) and Vulkan, so
 		// those can all run the NR pass. Only DX9/10 and OpenGL fall back to ReShade,
 		// since OptiScaler has no path for them. Informational (blue), not a warning.
+		// D3D8/D3D9 (bridged), D3D10 and OpenGL have no OptiScaler path at
+		// all, so the UI must recommend the ReShade method for them.
+		details.RecommendsReShade = detectedAPI == "d3d9" || detectedAPI == "d3d8" || detectedAPI == "d3d10" || detectedAPI == "opengl"
+		// D3D8/D3D9 games are additionally bridged via dgVoodoo2 automatically
+		// (ReShade cannot hook D3D8 at all).
 		switch detectedAPI {
-		case "d3d9", "d3d10", "opengl":
+		case "d3d9", "d3d8":
+			details.NeuralNote = fmt.Sprintf("This game runs on %s. The patcher installs the dgVoodoo2 bridge (%s -> %s) automatically, then ReShade + DLSS 5 on top — so use the ReShade method for Neural Rendering here.", details.RenderingAPI, strings.ToUpper(detectedAPI), dgvoodooOutputLabel())
+			details.NeuralNoteLevel = "info"
+		case "d3d10", "opengl":
 			details.NeuralNote = "This game runs on " + details.RenderingAPI + ". OptiScaler does not support this API, so use the ReShade method for Neural Rendering here."
 			details.NeuralNoteLevel = "info"
 		}
+	}
+	if details.Is32Bit && (gpu.NRTier == NRTierRTX40_50 || gpu.NRTier == NRTierRTX20_30) {
+		// 32-bit processes cannot load the 64-bit neural stack in-process, so
+		// they take the DLSS5-Feeder route: a 32-bit add-on plus a 64-bit
+		// host64 helper that starts by itself on the first fed frame.
+		details.NeuralSupport = true
+		details.NeuralNote = "This is a 32-bit game: DLSS 5 runs through the DLSS5-Feeder add-on plus its 64-bit host64 helper (starts by itself in-game, nothing to launch). In-game: enable Launchpad + DLSS 5 Feed, then use the feeder panel — the neural panel lives in the helper (Show the panel in-game, no alt-tab needed)."
+		details.NeuralNoteLevel = "info"
 	}
 
 	details.IsInstalled = a.checkDLSS5Installed(rootDir)
@@ -2601,6 +3059,31 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 		}
 	}
 	details.DLSS5Addon = checkAddonStatus()
+	if details.Is32Bit {
+		// 32-bit games take the DLSS5-Feeder route instead of the 64-bit
+		// in-process add-ons: dlss5-feed.addon32 beside the exe plus the
+		// host64\ helper. Stale 64-bit add-ons from older runs can never
+		// load here, so they must not count as "Installed".
+		hasA32, hasHost := false, false
+		for _, dir := range allDirs {
+			if fileExists(filepath.Join(dir, "dlss5-feed.addon32")) {
+				hasA32 = true
+			}
+			if isFeederHostDir(dir) || fileExists(filepath.Join(dir, feederHostDir, "dlss5-feed-host64.exe")) {
+				hasHost = true
+			}
+		}
+		switch {
+		case hasA32 && hasHost:
+			details.DLSS5Addon = "Installed (feeder + host64)"
+		case hasA32:
+			details.DLSS5Addon = "Incomplete (host64 missing)"
+		case hasHost:
+			details.DLSS5Addon = "Incomplete (feeder add-on missing)"
+		default:
+			details.DLSS5Addon = "Not Installed"
+		}
+	}
 
 	_, reshadeVer, reshadeAddon := getReshadeInfo(targetDir)
 	if reshadeVer != "" {
@@ -2612,6 +3095,10 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 			clean = "Installed + DLSS 5 add-on"
 		case details.DLSS5Addon == "Incomplete":
 			clean = "Installed (DLSS 5 add-on incomplete)"
+		case details.DLSS5Addon == "Installed (feeder + host64)":
+			clean = "Installed + DLSS 5 feeder"
+		case strings.HasPrefix(details.DLSS5Addon, "Incomplete ("):
+			clean = "Installed (feeder incomplete)"
 		default:
 			// A ReShade build still present after uninstall is purely the game's
 			// own shipped one; don't dress it up as this patcher's work.
@@ -2637,6 +3124,18 @@ func (a *App) GetGameDetails(gamePathOrExe string) GameDetails {
 		} else {
 			details.OptiScalerStatus = "Installed (proxy missing)"
 		}
+	}
+
+	// Detect the dgVoodoo2 bridge: a d3d9.dll/d3d8.dll that actually contains
+	// dgVoodoo code (a game's own DLL never matches).
+	for _, dir := range allDirs {
+		if isDgVoodooDLL(filepath.Join(dir, "d3d9.dll")) || isDgVoodooDLL(filepath.Join(dir, "d3d8.dll")) {
+			details.DgVoodooStatus = fmt.Sprintf("Installed (%s -> %s)", strings.ToUpper(detectedAPI), dgvoodooOutputLabel())
+			break
+		}
+	}
+	if (detectedAPI == "d3d9" || detectedAPI == "d3d8") && details.DgVoodooStatus != "Not Installed" {
+		details.RenderingAPI = details.RenderingAPI + " -> Direct3D " + strings.ToUpper(strings.TrimPrefix(dgvoodooOutputAPI(), "d3d")) + " (dgVoodoo2)"
 	}
 
 	targetDirs := a.findAllTargetDirs(rootDir)
@@ -2815,7 +3314,11 @@ func (a *App) backupAndRemoveDXVK(dir string) {
 // the feed to fabricate depth/motion input for the neural renderer.
 
 func (a *App) gameHasNativeDLSS(gamePath string) bool {
-	targetDir, _, launchExe, _, err := a.resolveGameTarget(gamePath)
+	return a.gameHasNativeDLSSWithExe(gamePath, "")
+}
+
+func (a *App) gameHasNativeDLSSWithExe(gamePath string, preferExe string) bool {
+	targetDir, _, launchExe, _, err := a.resolveGameTargetWithExe(gamePath, preferExe)
 	if err != nil || targetDir == "" {
 		return false
 	}
@@ -2845,8 +3348,416 @@ func nativeModeLabel(native bool) string {
 	return "Federated (feed + renodx)"
 }
 
+// dgvoodooUTF16 is the UTF-16LE encoding of "dgvoodoo". dgVoodoo2 carries
+// its name in the version resource ("dgVoodoo 2.87.4 - Direct3D9"), which is
+// UTF-16 — a plain ASCII scan never matches it (null bytes sit between every
+// character), so both encodings must be probed.
+var dgvoodooUTF16 = []byte{'d', 0, 'g', 0, 'v', 0, 'o', 0, 'o', 0, 'd', 0, 'o', 0, 'o', 0}
+
+// isDgVoodooDLL reports whether the given DLL is a dgVoodoo2 wrapper (a
+// Direct3D 9 -> Direct3D 11/12 translator). The wrapper's version resource
+// names it ("dgVoodoo 2.87.4 - Direct3D9"), which distinguishes the bridge
+// from a game's own d3d9.dll; a game's own DLL never carries that string.
+func isDgVoodooDLL(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	// ASCII-range lowercasing only; UTF-16LE structure (null bytes) is untouched.
+	lower := bytes.ToLower(b)
+	return bytes.Contains(lower, []byte("dgvoodoo")) || bytes.Contains(lower, dgvoodooUTF16)
+}
+
+// dgvoodooSourceDLL locates a dgVoodoo2 wrapper (e.g. "D3D9.dll", "D3D8.dll")
+// matching the game's bitness inside data/dgvoodoo. The official release zip
+// nests wrappers under MS/x86 and MS/x64 (and sometimes one extra top-level
+// folder), but users may also drop the DLLs in a flatter layout — every known
+// layout is probed, with a recursive filename search as the final fallback.
+// Returns "" when missing.
+func dgvoodooSourceDLL(is32 bool, wrapper string) string {
+	base := dataDir("dgvoodoo")
+	arch := "x64"
+	if is32 {
+		arch = "x86"
+	}
+	other := "x86"
+	if is32 {
+		other = "x64"
+	}
+	lowerWrapper := strings.ToLower(wrapper)
+	candidates := []string{
+		filepath.Join(base, "MS", arch, wrapper),
+		filepath.Join(base, "MS", arch, lowerWrapper),
+		filepath.Join(base, arch, wrapper),
+		filepath.Join(base, arch, lowerWrapper),
+		filepath.Join(base, wrapper),
+		filepath.Join(base, lowerWrapper),
+	}
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	// Recursive fallback: accept any matching wrapper under the data dir,
+	// preferring the one that sits in the matching architecture folder.
+	var fallback, archMatch string
+	_ = filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if !strings.EqualFold(info.Name(), wrapper) {
+			return nil
+		}
+		if fallback == "" {
+			fallback = path
+		}
+		if archMatch == "" && strings.Contains(strings.ToLower(path), strings.ToLower(arch)) {
+			archMatch = path
+		}
+		// Never pick the opposite architecture's folder as the fallback.
+		if fallback != "" && strings.Contains(strings.ToLower(fallback), strings.ToLower(other)) {
+			fallback = path
+		}
+		return nil
+	})
+	if archMatch != "" {
+		return archMatch
+	}
+	return fallback
+}
+
+// normalizeNeuralConsumer coerces a configured neural consumer to "dfc"
+// (Deep Fried Chicken) or "renodx" (default).
+func normalizeNeuralConsumer(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "dfc", "deep-fried-chicken", "deepfriedchicken", "chicken", "deep fried chicken":
+		return "dfc"
+	default:
+		return "renodx"
+	}
+}
+
+// neuralConsumer returns the selected neural consumer add-on set.
+func neuralConsumer() string {
+	return normalizeNeuralConsumer(loadAppConfig().NeuralConsumer)
+}
+
+// consumerAddonName returns the add-on file deployed for a consumer set.
+func consumerAddonName(selected string) string {
+	if normalizeNeuralConsumer(selected) == "dfc" {
+		return "deep-fried-chicken.addon64"
+	}
+	return "renodx-dlss5.addon64"
+}
+
+// consumerDeployFiles returns the file names (game-side) deployed for a
+// consumer set: the single RenoDX add-on, or the Deep Fried Chicken trio
+// (add-on + private NGX bridge + config).
+func consumerDeployFiles(selected string) []string {
+	if normalizeNeuralConsumer(selected) == "dfc" {
+		return []string{"deep-fried-chicken.addon64", "deep-fried-chicken-nvngx.dll", "deep-fried-chicken.cfg"}
+	}
+	return []string{"renodx-dlss5.addon64"}
+}
+
+// consumerSetComplete reports whether a consumer set is fully present under
+// the reshade data dir (per-folder layout).
+func consumerSetComplete(dir, selected string) bool {
+	for _, name := range consumerDeployFiles(selected) {
+		sub := "renodx-dlss5"
+		if normalizeNeuralConsumer(selected) == "dfc" {
+			sub = "deep-fried-chicken"
+		}
+		if !fileExists(filepath.Join(dir, sub, name)) && !fileExists(filepath.Join(dir, name)) {
+			return false
+		}
+	}
+	return true
+}
+
+// removeUnselectedConsumer deletes the NON-selected consumer's files from a
+// game directory so two neural providers never sit side by side (they fight
+// each other / go silently inert).
+func removeUnselectedConsumer(dir, selected string) {
+	other := "renodx"
+	if normalizeNeuralConsumer(selected) == "renodx" {
+		other = "dfc"
+	}
+	for _, name := range consumerDeployFiles(other) {
+		if p := filepath.Join(dir, name); fileExists(p) {
+			writeLog("removeUnselectedConsumer: removing " + p)
+			_ = cleanDLL(p)
+		}
+	}
+}
+
+// normalizeDgVoodooAPI coerces a configured dgVoodoo2 output backend to one
+// of the two supported values. Anything unknown falls back to "d3d11".
+func normalizeDgVoodooAPI(v string) string {
+	if strings.EqualFold(strings.TrimSpace(v), "d3d12") {
+		return "d3d12"
+	}
+	return "d3d11"
+}
+
+// dgvoodooOutputAPI returns the configured dgVoodoo2 output backend:
+// "d3d11" (default, most compatible) or "d3d12" (user-selectable in Settings).
+func dgvoodooOutputAPI() string {
+	return normalizeDgVoodooAPI(loadAppConfig().DgVoodooAPI)
+}
+
+// dgvoodooOutputLabel is the display name of the configured output backend.
+func dgvoodooOutputLabel() string {
+	if dgvoodooOutputAPI() == "d3d12" {
+		return "D3D12"
+	}
+	return "D3D11"
+}
+
+// dgvoodooConfOutputAPI is the dgVoodoo.conf OutputAPI value matching the
+// configured backend. D3D12 uses feature level 11.0 (the author's recommended
+// compatibility mode for old D3D8/9 drivers) rather than 12.0.
+func dgvoodooConfOutputAPI() string {
+	if dgvoodooOutputAPI() == "d3d12" {
+		return "d3d12_fl11_0"
+	}
+	return "d3d11_fl11_0"
+}
+
+// defaultDgVoodooConf returns the patcher's dgVoodoo2 local config. It locks
+// the output API to the configured backend (D3D11 FL 11.0 by default) so the
+// matching ReShade hook and the DLSS 5 add-ons always line up, while leaving
+// resolution, filtering and every other rendering knob app-driven / unforced
+// so the game — and DLSS upscaling — stays in control of the image.
+func defaultDgVoodooConf() string {
+	// Replace the full assignment line (not the bare value, which also
+	// appears in the comment block listing valid OutputAPI values).
+	return strings.Replace(dgvoodooConfTemplate(),
+		"OutputAPI                            = d3d11_fl11_0",
+		"OutputAPI                            = "+dgvoodooConfOutputAPI(), 1)
+}
+
+// dgvoodooConfTemplate is the raw dgVoodoo.conf text with the default
+// (D3D11) output baked in; defaultDgVoodooConf swaps the OutputAPI value.
+func dgvoodooConfTemplate() string {
+	return `; dgVoodoo2 local config deployed by DLSS 5 Patcher.
+; Bridges Direct3D 9 games to modern Direct3D so ReShade + DLSS 5 can run.
+; Advanced users may tune this with dgVoodooCpl; the patcher only needs
+; OutputAPI to match the ReShade hook it installs (D3D11 or D3D12).
+
+Version                              = 0x281
+
+[General]
+
+;       OutputAPI: "d3d11warp", "d3d11_fl10_0", "d3d11_fl10_1", "d3d11_fl11_0",
+;                  "d3d12_fl11_0", "d3d12_fl12_0", "bestavailable"
+
+OutputAPI                            = d3d11_fl11_0
+Adapters                             = all
+FullScreenOutput                     = default
+FullScreenMode                       = true
+ScalingMode                          = unspecified
+ProgressiveScanlineOrder             = false
+EnumerateRefreshRates                = false
+
+Brightness                           = 100
+Color                                = 100
+Contrast                             = 100
+InheritColorProfileInFullScreenMode  = true
+
+KeepWindowAspectRatio                = true
+CaptureMouse                         = true
+CenterAppWindow                      = false
+
+[GeneralExt]
+
+DesktopResolution                    =
+DesktopBitDepth                      =
+DeframerSize                         = 1
+ImageScaleFactor                     = 1
+CursorScaleFactor                    = 0
+DisplayROI                           =
+Resampling                           = bilinear
+PresentationModel                    = auto
+ColorSpace                           = appdriven
+FreeMouse                            = false
+WindowedAttributes                   =
+FullscreenAttributes                 =
+FPSLimit                             = 0
+Environment                          =
+SystemHookFlags                      =
+
+[DirectX]
+
+DisableAndPassThru                  = false
+
+VideoCard                           = internal3D
+VRAM                                = 1024
+Filtering                           = appdriven
+KeepFilterIfPointSampled            = false
+DisableMipmapping                   = false
+Resolution                          = unforced
+Antialiasing                        = appdriven
+
+AppControlledScreenMode             = true
+DisableAltEnterToToggleScreenMode   = true
+
+Bilinear2DOperations                = false
+PhongShadingWhenPossible            = false
+ForceVerticalSync                   = false
+dgVoodooWatermark                   = false
+FastVideoMemoryAccess               = false
+
+[DirectXExt]
+
+AdapterIDType                       =
+VendorID                            =
+DeviceID                            =
+SubsystemID                         =
+RevisionID                          =
+
+DefaultEnumeratedResolutions        = all
+ExtraEnumeratedResolutions          =
+EnumeratedResolutionBitdepths       = all
+
+DitheringEffect                     = high_quality
+Dithering                           = forcealways
+DitherOrderedMatrixSizeScale        = 0
+DepthBuffersBitDepth                = appdriven
+Default3DRenderFormat               = auto
+
+MaxVSConstRegisters                 = 256
+
+NPatchTesselationLevel              = 0
+
+DisplayOutputEnableMask             = 0xffffffff
+
+MSD3DDeviceNames                    = false
+RTTexturesForceScaleAndMSAA         = true
+SmoothedDepthSampling               = true
+DeferredScreenModeSwitch            = false
+PrimarySurfaceBatchedUpdate         = false
+SuppressAMDBlacklist                = false
+
+[Debug]
+
+Info                                = enable
+Warning                             = enable
+Error                               = enable
+MaxTraceLevel                       = 0
+`
+}
+
+// InstallDgVoodoo installs the dgVoodoo2 Direct3D 8/9 bridge into the game's
+// target folder: the wrapper DLL (d3d8.dll or d3d9.dll) matching the game's
+// bitness plus a local dgVoodoo.conf tuned per the feeder project's recipe
+// (pass-thru off, 1GB VRAM, internal3D card, configured output backend).
+// After this call the game renders through modern Direct3D, so ReShade must
+// be installed as dxgi.dll (never the wrapped name, which dgVoodoo owns).
+func (a *App) InstallDgVoodoo(gamePath string) PatchResult {
+	return a.installDgVoodooWithExe(gamePath, "")
+}
+
+func (a *App) installDgVoodooWithExe(gamePath string, preferExe string) PatchResult {
+	writeLog("InstallDgVoodoo: Starting dgVoodoo2 bridge installation for " + gamePath)
+
+	if strings.TrimSpace(gamePath) == "" {
+		return PatchResult{Success: false, Message: "Game path cannot be empty"}
+	}
+
+	exePath, _ := os.Executable()
+	exeDir := filepath.Dir(exePath)
+	if isSameOrChildDirectory(gamePath, exeDir) {
+		return PatchResult{Success: false, Message: "Cannot patch the patcher directory itself"}
+	}
+
+	if running, procName := a.isGameRunning(gamePath); running {
+		writeLog(fmt.Sprintf("InstallDgVoodoo: BLOCKED - Game process '%s' is currently running", procName))
+		return PatchResult{
+			Success: false,
+			Message: fmt.Sprintf("Game is currently running (%s). Please close the game first and try again.", procName),
+		}
+	}
+
+	targetDir, targetExe, _, api, err := a.resolveGameTargetWithExe(gamePath, preferExe)
+	if err != nil {
+		writeLog("InstallDgVoodoo: ERROR resolving target: " + err.Error())
+		return PatchResult{Success: false, Message: err.Error()}
+	}
+	// ReShade cannot hook Direct3D 8 at all, so D3D8 games always go through
+	// the bridge exactly like D3D9 ones.
+	wrapper := ""
+	moduleName := ""
+	switch api {
+	case "d3d9":
+		wrapper, moduleName = "D3D9.dll", "d3d9.dll"
+	case "d3d8":
+		wrapper, moduleName = "D3D8.dll", "d3d8.dll"
+	default:
+		return PatchResult{Success: false, Message: fmt.Sprintf("dgVoodoo2 bridge only applies to Direct3D 8/9 games (detected: %s)", api)}
+	}
+
+	a.emitPatchStatus("Preparing dgVoodoo2 data files (download from config if needed)...")
+	if err := a.ensureDataset("dgvoodoo"); err != nil {
+		return PatchResult{Success: false, Message: "Missing dgVoodoo2 data. Please check the error dialog."}
+	}
+
+	is32 := is32BitExe(targetExe)
+	archLabel := "x64"
+	if is32 {
+		archLabel = "x86"
+	}
+	src := dgvoodooSourceDLL(is32, wrapper)
+	if src == "" {
+		msg := fmt.Sprintf("dgVoodoo2 %s %s wrapper not found in %s. Set dgvoodoo_url in config.json or extract the official dgVoodoo2 zip there (MS/%s/%s). Note: Windows Defender is known to false-flag dgVoodoo2 as malware and quarantine it — if the download keeps disappearing, add an exclusion for the data folder.", archLabel, moduleName, dataDir("dgvoodoo"), archLabel, wrapper)
+		writeLog("InstallDgVoodoo: ERROR - " + msg)
+		return PatchResult{Success: false, Message: msg}
+	}
+
+	if api == "d3d9" {
+		// A DXVK d3d9.dll occupies the exact filename the bridge needs; back
+		// it up and remove it first (game's own files are already backed up
+		// by BackupOriginalFiles, this only clears the DXVK conflict).
+		a.backupAndRemoveDXVK(targetDir)
+	}
+	// Remember a game-shipped wrapper in the patcher backup so uninstall can
+	// restore it (no-op when the game ships none).
+	_ = a.installBackupDLL(targetDir, moduleName)
+
+	a.emitPatchStatus(fmt.Sprintf("Installing dgVoodoo2 %s -> %s bridge (%s)...", strings.ToUpper(api), dgvoodooOutputLabel(), archLabel))
+	dst := filepath.Join(targetDir, moduleName)
+	writeLog(fmt.Sprintf("InstallDgVoodoo: Copying %s to %s", src, dst))
+	if err := copyFile(src, dst); err != nil {
+		writeLog("InstallDgVoodoo: ERROR copying wrapper: " + err.Error())
+		return PatchResult{Success: false, Message: "Failed to install dgVoodoo2 wrapper: " + err.Error()}
+	}
+
+	confPath := filepath.Join(targetDir, "dgVoodoo.conf")
+	writeLog("InstallDgVoodoo: Writing dgVoodoo.conf (" + dgvoodooOutputLabel() + " output) at " + confPath)
+	if err := os.WriteFile(confPath, []byte(defaultDgVoodooConf()), 0644); err != nil {
+		writeLog("InstallDgVoodoo: ERROR writing dgVoodoo.conf: " + err.Error())
+		return PatchResult{Success: false, Message: "Failed to write dgVoodoo.conf: " + err.Error()}
+	}
+
+	writeLog("InstallDgVoodoo: dgVoodoo2 bridge installed successfully in " + targetDir)
+	return PatchResult{Success: true, Message: fmt.Sprintf("dgVoodoo2 %s -> %s bridge installed (%s)", strings.ToUpper(api), dgvoodooOutputLabel(), archLabel)}
+}
+
 // InstallReshade installs ReShade to the target game folder using command line or manual fallback
 func (a *App) InstallReshade(gamePath string) PatchResult {
+	return a.installReshadeWithAPI(gamePath, "")
+}
+
+// installReshadeWithAPI is the shared ReShade installer. apiOverride forces
+// the ReShade hook API instead of the detected one — used for D3D9 games
+// running through the dgVoodoo2 bridge, where ReShade must hook the bridge's
+// D3D11 output ("d3d11") rather than the game's native D3D9 ("d3d9"), whose
+// filename is already occupied by the dgVoodoo wrapper.
+func (a *App) installReshadeWithAPI(gamePath string, apiOverride string) PatchResult {
+	return a.installReshadeWithExe(gamePath, apiOverride, "")
+}
+
+func (a *App) installReshadeWithExe(gamePath string, apiOverride string, preferExe string) PatchResult {
 	writeLog("InstallReshade: Starting ReShade installation for " + gamePath)
 
 	if strings.TrimSpace(gamePath) == "" {
@@ -2867,12 +3778,16 @@ func (a *App) InstallReshade(gamePath string) PatchResult {
 		}
 	}
 
-	targetDir, targetExe, _, api, err := a.resolveGameTarget(gamePath)
+	targetDir, targetExe, _, api, err := a.resolveGameTargetWithExe(gamePath, preferExe)
 	if err != nil {
 		writeLog("InstallReshade: ERROR resolving target: " + err.Error())
 		return PatchResult{Success: false, Message: err.Error()}
 	}
-	native := a.gameHasNativeDLSS(gamePath)
+	if apiOverride != "" && apiOverride != api {
+		writeLog(fmt.Sprintf("InstallReshade: API override %s -> %s (dgVoodoo2 bridge output)", api, apiOverride))
+		api = apiOverride
+	}
+	native := a.gameHasNativeDLSSWithExe(gamePath, preferExe)
 
 	// A DX9 game running through DXVK (d3d9.dll -> Vulkan) blocks ReShade's own
 	// d3d9 hook. If present, back it up and remove it so ReShade can install.
@@ -3093,11 +4008,15 @@ PreprocessorDefinitions=DLSS5_MV_PROVIDER=2
 
 // copyReshadeFilesManually copies ReShade files manually
 // is32BitExe reports whether the given PE executable is a 32-bit (x86) build.
-// ReShade ships separate 32- and 64-bit hooks and a 32-bit game cannot load a
-// 64-bit DLL, so the correct hook must be chosen based on the game's bitness.
+// The Machine field is read manually first so old/non-standard executables
+// (e.g. GTA Vice City's gta-vc.exe, which debug/pe refuses to open) are still
+// classified correctly; debug/pe is only a fallback.
 func is32BitExe(exePath string) bool {
 	if exePath == "" {
 		return false
+	}
+	if m, err := peMachineType(exePath); err == nil {
+		return m == pe.IMAGE_FILE_MACHINE_I386
 	}
 	f, err := pe.Open(exePath)
 	if err != nil {
@@ -3194,7 +4113,247 @@ func (a *App) copyEffects(targetDir string) error {
 }
 
 // InstallDLSS5 copies DLSS 5 files to the target game directory and Streamline/ThirdParty plugin subdirectories
+// feederHostDir is the 64-bit helper folder placed next to the game exe for
+// 32-bit games (DLSS5-Feeder route).
+const feederHostDir = "host64"
+
+// isFeederHostDir reports whether dir is a patcher-managed host64 folder:
+// named host64 and containing the helper exe.
+func isFeederHostDir(dir string) bool {
+	if strings.ToLower(filepath.Base(dir)) != feederHostDir {
+		return false
+	}
+	return fileExists(filepath.Join(dir, "dlss5-feed-host64.exe"))
+}
+
+// feederFile resolves a file inside data/feeder (e.g. "dlss5-feed.addon32",
+// "host64/dlss5-feed-host64.exe", "reshade-shaders/Shaders/DLSS5_Feed.fx").
+func feederFile(rel string) string {
+	if p := filepath.Join(dataDir("feeder"), rel); fileExists(p) {
+		return p
+	}
+	return ""
+}
+
+// dlssFile resolves a neural-runtime file, checking the reshade dataset
+// first (including the per-consumer subfolders) and the shared dlss5 dataset
+// second (the rule InstallDLSS5 uses).
+func dlssFile(name string) string {
+	reshadeBase := getAssetPath(filepath.Join("data", "reshade"))
+	for _, d := range []string{
+		reshadeBase,
+		filepath.Join(reshadeBase, "renodx-dlss5"),
+		filepath.Join(reshadeBase, "deep-fried-chicken"),
+		getAssetPath(filepath.Join("data", "dlss5")),
+	} {
+		if p := filepath.Join(d, name); fileExists(p) {
+			return p
+		}
+	}
+	return ""
+}
+
+// isConsumerCompanion reports whether a file travels with the neural
+// consumer add-on to every hook dir (Deep Fried Chicken's private NGX
+// bridge + config).
+func isConsumerCompanion(file string) bool {
+	return file == "deep-fried-chicken-nvngx.dll" || file == "deep-fried-chicken.cfg"
+}
+
+// resolveDLSS5Src resolves a deploy payload for InstallDLSS5: the feeder
+// add-on prefers the feeder release (same build as its shader), everything
+// else falls back from the reshade dir to the shared dlss5 dir.
+func resolveDLSS5Src(srcPath, dlss5Path, file string) string {
+	if file == "dlss5-feed.addon64" {
+		if p := feederAddonSource(false); p != "" {
+			return p
+		}
+	}
+	// Covers the reshade root, the per-consumer subfolders and data/dlss5.
+	if p := dlssFile(file); p != "" {
+		return p
+	}
+	src := filepath.Join(srcPath, file)
+	if _, err := os.Stat(src); os.IsNotExist(err) {
+		src = filepath.Join(dlss5Path, file)
+	}
+	return src
+}
+
+// reshade64Hook resolves the 64-bit add-on ReShade DLL for the host64 folder,
+// extracting it from the add-on setup on demand.
+func (a *App) reshade64Hook() string {
+	dll := getAssetPath(filepath.Join("data", reshadeSetupDir, "Extracted", "ReShade64.dll"))
+	if !fileExists(dll) {
+		if setup, err := a.getReShadeSetup(); err == nil {
+			_ = extractReshadeDLL(setup, filepath.Dir(dll), "ReShade64.dll")
+		}
+	}
+	if !fileExists(dll) || !isAddonCapableReShade(dll) {
+		return ""
+	}
+	return dll
+}
+
+// ensureFeederMVProvider pins DLSS5_MV_PROVIDER=1 (iMMERSE Launchpad, the
+// bundled enabled provider) in the game's ReShade.ini and preset. The shared
+// config writers default to another provider, which the feeder would flag as
+// a mismatch (overlay + log) and run with no motion vectors.
+func ensureFeederMVProvider(targetDir string) {
+	mvKey := regexp.MustCompile(`(?i)DLSS5_MV_PROVIDER\s*=`)
+	for _, p := range []string{filepath.Join(targetDir, "ReShade.ini"), filepath.Join(targetDir, "ReShadePreset.ini")} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		updated := strings.ReplaceAll(string(b), "DLSS5_MV_PROVIDER=2", "DLSS5_MV_PROVIDER=1")
+		if !mvKey.MatchString(updated) {
+			// ReShade rewrites these files at runtime (AutoSavePreset) and can
+			// drop the key entirely — append it so the feed gets motion vectors.
+			writeLog("ensureFeederMVProvider: provider key missing, appending to " + p)
+			if !strings.HasSuffix(updated, "\n") {
+				updated += "\n"
+			}
+			updated += "[DLSS5_Feed.fx]\nPreprocessorDefinitions=DLSS5_MV_PROVIDER=1\n"
+		}
+		if updated != string(b) {
+			writeLog("ensureFeederMVProvider: pinning provider=1 (Launchpad) in " + p)
+			_ = os.WriteFile(p, []byte(updated), 0644)
+		}
+	}
+}
+
+// InstallFeeder32 installs the DLSS5-Feeder 32-bit route: dlss5-feed.addon32
+// next to the game exe plus a host64\ helper folder (host exe, 64-bit ReShade
+// dxgi.dll, neural consumer, NGX runtimes). NGX exists as 64-bit code only,
+// so the helper does the DLSS work cross-process; the first fed frame starts
+// it by itself — nothing needs launching by hand.
+func (a *App) InstallFeeder32(gamePath string) PatchResult {
+	return a.installFeeder32WithExe(gamePath, "")
+}
+
+func (a *App) installFeeder32WithExe(gamePath string, preferExe string) PatchResult {
+	writeLog("InstallFeeder32: Starting DLSS5-Feeder 32-bit installation for " + gamePath)
+
+	if strings.TrimSpace(gamePath) == "" {
+		return PatchResult{Success: false, Message: "Game path cannot be empty"}
+	}
+
+	exePath, _ := os.Executable()
+	exeDir := filepath.Dir(exePath)
+	if isSameOrChildDirectory(gamePath, exeDir) {
+		return PatchResult{Success: false, Message: "Cannot patch the patcher directory itself"}
+	}
+
+	if running, procName := a.isGameRunning(gamePath); running {
+		writeLog(fmt.Sprintf("InstallFeeder32: BLOCKED - Game process '%s' is currently running", procName))
+		return PatchResult{
+			Success: false,
+			Message: fmt.Sprintf("Game is currently running (%s). Please close the game first and try again.", procName),
+		}
+	}
+
+	targetDir, targetExe, _, _, err := a.resolveGameTargetWithExe(gamePath, preferExe)
+	if err != nil {
+		return PatchResult{Success: false, Message: err.Error()}
+	}
+	if !is32BitExe(targetExe) {
+		return PatchResult{Success: false, Message: "DLSS5-Feeder 32-bit route is for 32-bit games only"}
+	}
+
+	// Drop stale 64-bit in-process add-ons from older runs: a 32-bit ReShade
+	// ignores them, and a second neural add-on beside the feeder would go
+	// silently inert. host64\ is untouched — its consumer copy is correct there.
+	for _, dir := range a.findAllTargetDirs(gamePath) {
+		if isFeederHostDir(dir) {
+			continue
+		}
+		for _, stale := range []string{"renodx-dlss5.addon64", "dlss5-feed.addon64", "deep-fried-chicken.addon64", "deep-fried-chicken-nvngx.dll", "deep-fried-chicken.cfg"} {
+			if p := filepath.Join(dir, stale); fileExists(p) {
+				writeLog("InstallFeeder32: removing stale unloadable add-on " + p)
+				_ = cleanDLL(p)
+			}
+		}
+	}
+
+	a.emitPatchStatus("Preparing DLSS5-Feeder data files (download from config if needed)...")
+	for _, label := range []string{"feeder", "reshade", "dlss5"} {
+		if err := a.ensureDataset(label); err != nil {
+			return PatchResult{Success: false, Message: "Missing data. Please check the error dialog."}
+		}
+	}
+
+	// 1. 32-bit feeder add-on next to the game exe (32-bit ReShade only
+	// scans *.addon/*.addon32 — a 64-bit add-on beside the game is ignored).
+	addon32Src := feederFile("dlss5-feed.addon32")
+	if addon32Src == "" {
+		msg := "dlss5-feed.addon32 not found in " + dataDir("feeder") + ". Set feeder_url in config.json or extract the official DLSS5-Feeder zip there."
+		writeLog("InstallFeeder32: ERROR - " + msg)
+		return PatchResult{Success: false, Message: msg}
+	}
+	a.emitPatchStatus("Installing DLSS5-Feeder 32-bit add-on...")
+	if err := copyFile(addon32Src, filepath.Join(targetDir, "dlss5-feed.addon32")); err != nil {
+		return PatchResult{Success: false, Message: "Failed to copy dlss5-feed.addon32: " + err.Error()}
+	}
+
+	// 2. Feed shader from the SAME release as the add-on (upstream: keep the
+	// pair together; mixed halves cause confusing failures).
+	if fxSrc := feederFile(filepath.Join("reshade-shaders", "Shaders", "DLSS5_Feed.fx")); fxSrc != "" {
+		fxDstDir := filepath.Join(targetDir, "reshade-shaders", "Shaders")
+		if err := os.MkdirAll(fxDstDir, 0755); err == nil {
+			writeLog("InstallFeeder32: refreshing DLSS5_Feed.fx from feeder release")
+			_ = copyFile(fxSrc, filepath.Join(fxDstDir, "DLSS5_Feed.fx"))
+		}
+	}
+	ensureFeederMVProvider(targetDir)
+
+	// 3. host64\ helper folder: host exe, 64-bit ReShade, neural consumer
+	// (RenoDX route — available locally, no download needed), NGX runtimes.
+	hostDir := filepath.Join(targetDir, feederHostDir)
+	if err := os.MkdirAll(hostDir, 0755); err != nil {
+		return PatchResult{Success: false, Message: "Failed to create host64 folder: " + err.Error()}
+	}
+	hostExeSrc := feederFile(filepath.Join(feederHostDir, "dlss5-feed-host64.exe"))
+	if hostExeSrc == "" {
+		msg := "dlss5-feed-host64.exe not found in " + dataDir("feeder") + ". Re-extract the official DLSS5-Feeder zip (keep host64\\ with dlss5-feed.addon32)."
+		writeLog("InstallFeeder32: ERROR - " + msg)
+		return PatchResult{Success: false, Message: msg}
+	}
+	a.emitPatchStatus("Installing host64 helper (64-bit DLSS side)...")
+	if err := copyFile(hostExeSrc, filepath.Join(hostDir, "dlss5-feed-host64.exe")); err != nil {
+		return PatchResult{Success: false, Message: "Failed to copy host helper: " + err.Error()}
+	}
+	if hook := a.reshade64Hook(); hook == "" {
+		return PatchResult{Success: false, Message: "Add-on capable 64-bit ReShade not available for the host64 folder."}
+	} else if err := copyFile(hook, filepath.Join(hostDir, "dxgi.dll")); err != nil {
+		return PatchResult{Success: false, Message: "Failed to copy host ReShade: " + err.Error()}
+	}
+	// Selected neural consumer + runtimes into host64 (never beside the game:
+	// a 32-bit process cannot load them, and a second neural add-on beside
+	// the feeder would go silently inert).
+	sel32 := neuralConsumer()
+	hostFiles := append(consumerDeployFiles(sel32), "nvngx_dlssnr.dll", "nvngx_dlss.dll")
+	removeUnselectedConsumer(hostDir, sel32)
+	for _, name := range hostFiles {
+		src := dlssFile(name)
+		if src == "" {
+			return PatchResult{Success: false, Message: "Source file not found: " + name}
+		}
+		writeLog("InstallFeeder32: copying " + name + " to host64")
+		if err := copyFile(src, filepath.Join(hostDir, name)); err != nil {
+			return PatchResult{Success: false, Message: "Failed to copy " + name + ": " + err.Error()}
+		}
+	}
+
+	writeLog("InstallFeeder32: DLSS5-Feeder 32-bit route installed in " + targetDir)
+	return PatchResult{Success: true, Message: "DLSS5-Feeder 32-bit installed (addon32 + host64 helper, starts by itself in-game)"}
+}
+
 func (a *App) InstallDLSS5(gamePath string) PatchResult {
+	return a.installDLSS5WithExe(gamePath, "")
+}
+
+func (a *App) installDLSS5WithExe(gamePath string, preferExe string) PatchResult {
 	writeLog("InstallDLSS5: Starting DLSS 5 installation for " + gamePath)
 
 	if strings.TrimSpace(gamePath) == "" {
@@ -3215,9 +4374,32 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 		}
 	}
 
-	targetDir, _, _, _, err := a.resolveGameTarget(gamePath)
+	targetDir, targetExe, _, _, err := a.resolveGameTargetWithExe(gamePath, preferExe)
 	if err != nil {
 		return PatchResult{Success: false, Message: err.Error()}
+	}
+
+	// 32-bit games cannot load the neural stack in-process: ReShade only
+	// scans *.addon/*.addon32, renodx-dlss5 ships as 64-bit-only, and NVIDIA
+	// provides no 32-bit NGX runtime at all. Deploying those files would only
+	// litter the folder and fake an "Installed" status, so skip them here —
+	// dgVoodoo + ReShade + shaders (other pipeline steps) keep working and
+	// are where a 32-bit game's value comes from.
+	if is32BitExe(targetExe) {
+		writeLog("InstallDLSS5: 32-bit target (" + targetExe + ") - skipping 64-bit neural add-on deploy")
+		a.emitPatchStatus("32-bit game: skipping neural add-on (64-bit only)...")
+		for _, dir := range a.findAllTargetDirs(gamePath) {
+			if isFeederHostDir(dir) {
+				continue
+			}
+			for _, stale := range []string{"renodx-dlss5.addon64", "dlss5-feed.addon64", "deep-fried-chicken.addon64", "deep-fried-chicken-nvngx.dll", "deep-fried-chicken.cfg"} {
+				if p := filepath.Join(dir, stale); fileExists(p) {
+					writeLog("InstallDLSS5: removing stale unloadable add-on " + p)
+					_ = cleanDLL(p)
+				}
+			}
+		}
+		return PatchResult{Success: true, Message: "DLSS 5 neural add-on skipped (32-bit game cannot load 64-bit add-ons); ReShade + dgVoodoo remain active"}
 	}
 
 	// Ensure reshade + dlss5 data sets are complete before deploying files.
@@ -3233,50 +4415,49 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 	writeLog("InstallDLSS5: Reshade source: " + srcPath + " | DLSS5 shared: " + dlss5Path + " -> Target: " + targetDir)
 
 	// Whether the game is native-DLSS decides the add-on set: federated
-	// (feed + renodx) for games without DLSS, Direct (renodx only) for games
-	// that ship nvngx_dlss.dll so we do not race their NGX session.
-	native := a.gameHasNativeDLSS(gamePath)
+	// (feed + selected neural consumer) for games without DLSS, Direct
+	// (consumer only) for games that ship nvngx_dlss.dll so we do not race
+	// their NGX session. The DLSS 5 feed add-on must accompany the consumer
+	// so the neural renderer's guides are produced by ReShade too.
+	native := a.gameHasNativeDLSSWithExe(gamePath, preferExe)
 	writeLog(fmt.Sprintf("InstallDLSS5: native DLSS runtime in active dir: %v (mode: %s)", native, nativeModeLabel(native)))
 	if native {
-		a.emitPatchStatus("Native DLSS detected -> installing RenoDX add-on only (no feeder)...")
+		a.emitPatchStatus("Native DLSS detected -> installing neural consumer add-on only (no feeder)...")
 	} else {
-		a.emitPatchStatus("No native DLSS -> installing RenoDX + DLSS5-Feed add-ons...")
+		a.emitPatchStatus("No native DLSS -> installing neural consumer + DLSS5-Feed add-ons...")
 	}
 
 	// Detect GPU to decide whether neural rendering (nvngx_dlssnr.dll) is
-	// supported.  Only RTX 50 (Blackwell) series GPUs can run DLSSNR; on
-	// older cards the NGX runtime rejects the feature with 0xBAD00001.
-	// The neural renderer DLL is ALWAYS deployed regardless — on non-RTX 50
-	// cards it is simply ignored, but it must be present for neural
+	// supported. The neural renderer DLL is ALWAYS deployed regardless — on
+	// older cards it is simply ignored, but it must be present for neural
 	// rendering to ever run (and when GPU detection is inconclusive).
 	gpu := detectGPU()
 	if !gpu.SupportsNeuralRendering {
 		writeLog(fmt.Sprintf("InstallDLSS5: GPU '%s' — Neural Rendering may not be supported, but nvngx_dlssnr.dll will still be deployed", gpu.Name))
 	}
 
-	// The DLSS 5 feed add-on must accompany the RenoDX add-on so the neural
-	// renderer's guides are produced by ReShade for 64-bit D3D12 games too.
-	filesToShipping := []string{
-		"renodx-dlss5.addon64",
+	sel := neuralConsumer()
+	writeLog("InstallDLSS5: neural consumer: " + sel)
+	removeUnselectedConsumer(targetDir, sel)
+	filesToShipping := append(consumerDeployFiles(sel),
 		"nvngx_dlss.dll",
 		"nvngx_dlssnr.dll",
-	}
+	)
 	if !native {
 		filesToShipping = append(filesToShipping, "dlss5-feed.addon64")
 	}
 	if native {
 		// Direct mode leaves the game's own upscaler binary in place so NGX
-		// hook targets line up; only spread renodx + the neural renderer DLL.
-		filesToShipping = []string{"renodx-dlss5.addon64", "nvngx_dlssnr.dll"}
+		// hook targets line up; only spread the consumer + the neural renderer DLL.
+		filesToShipping = append(consumerDeployFiles(sel), "nvngx_dlssnr.dll")
 	}
 
 	a.emitPatchStatus("Copying DLSS 5 add-on files to game folder...")
 	for _, file := range filesToShipping {
-		// Resolve source: check reshade-specific dir first, then shared dlss5 dir
-		src := filepath.Join(srcPath, file)
-		if _, err := os.Stat(src); os.IsNotExist(err) {
-			src = filepath.Join(dlss5Path, file)
-		}
+		// Resolve source: the feeder add-on prefers the feeder release (same
+		// build as the shader), everything else checks the reshade-specific
+		// dir first, then the shared dlss5 dir.
+		src := resolveDLSS5Src(srcPath, dlss5Path, file)
 		dst := filepath.Join(targetDir, file)
 
 		writeLog(fmt.Sprintf("InstallDLSS5: Copying %s to shipping dir %s", src, dst))
@@ -3307,10 +4488,11 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 	}
 	addonDirs = a.uniqueDirs(addonDirs)
 
-	addonFiles := []string{"dlss5-feed.addon64", "renodx-dlss5.addon64", "nvngx_dlss.dll", "nvngx_dlssnr.dll"}
+	consumerFiles := consumerDeployFiles(sel)
+	addonFiles := append(append([]string{"dlss5-feed.addon64"}, consumerFiles...), "nvngx_dlss.dll", "nvngx_dlssnr.dll")
 	if native {
 		// Direct mode: no Feeder, keep the game's existing upscaler runtime.
-		addonFiles = []string{"renodx-dlss5.addon64", "nvngx_dlssnr.dll"}
+		addonFiles = append(append([]string{}, consumerFiles...), "nvngx_dlssnr.dll")
 	}
 	a.emitPatchStatus("Spreading DLSS 5 add-ons to hook directories...")
 	for _, dir := range addonDirs {
@@ -3323,7 +4505,7 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 		}
 
 		hasDLSSOrStreamline := false
-		checkFiles := []string{"nvngx_dlss.dll", "sl.dlss.dll", "sl.interposer.dll", "sl.dlss_g.dll", "sl.deepdvc.dll", "dxgi.dll", "renodx-dlss5.addon64", "dlss5-feed.addon64"}
+		checkFiles := []string{"nvngx_dlss.dll", "sl.dlss.dll", "sl.interposer.dll", "sl.dlss_g.dll", "sl.deepdvc.dll", "dxgi.dll", "renodx-dlss5.addon64", "dlss5-feed.addon64", "deep-fried-chicken.addon64"}
 		for _, cf := range checkFiles {
 			if _, err := os.Stat(filepath.Join(dir, cf)); err == nil {
 				hasDLSSOrStreamline = true
@@ -3332,9 +4514,9 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 		}
 
 		for _, file := range addonFiles {
-			if file == "renodx-dlss5.addon64" || file == "dlss5-feed.addon64" {
+			if file == consumerAddonName(sel) || file == "dlss5-feed.addon64" || isConsumerCompanion(file) {
 				// Add-ons belong to every directory that ReShade hooks.
-				src := filepath.Join(srcPath, file)
+				src := resolveDLSS5Src(srcPath, dlss5Path, file)
 				dst := filepath.Join(dir, file)
 				writeLog(fmt.Sprintf("InstallDLSS5: Copying %s to target dir %s", src, dst))
 				if _, err := os.Stat(src); err == nil {
@@ -3362,6 +4544,16 @@ func (a *App) InstallDLSS5(gamePath string) PatchResult {
 
 	a.emitPatchStatus("DLSS 5 add-ons installed.")
 	writeLog("InstallDLSS5: All DLSS 5 files installed successfully across target directories")
+	// Keep the feed shader on the same build as the feeder add-on (upstream:
+	// keep the pair together; mixed halves cause confusing failures).
+	if fxSrc := feederShaderSource(); fxSrc != "" {
+		fxDstDir := filepath.Join(targetDir, "reshade-shaders", "Shaders")
+		if err := os.MkdirAll(fxDstDir, 0755); err == nil {
+			writeLog("InstallDLSS5: refreshing DLSS5_Feed.fx from feeder release")
+			_ = copyFile(fxSrc, filepath.Join(fxDstDir, "DLSS5_Feed.fx"))
+		}
+	}
+	ensureFeederMVProvider(targetDir)
 	return PatchResult{Success: true, Message: "DLSS 5 files installed successfully"}
 }
 
@@ -3398,6 +4590,10 @@ func (a *App) uniqueDirs(dirs []string) []string {
 
 // InstallOptiScaler installs OptiScaler as a dxgi.dll proxy with auto GPU detection
 func (a *App) InstallOptiScaler(gamePath string) PatchResult {
+	return a.installOptiScalerWithExe(gamePath, "")
+}
+
+func (a *App) installOptiScalerWithExe(gamePath string, preferExe string) PatchResult {
 	writeLog("InstallOptiScaler: Starting OptiScaler installation for " + gamePath)
 
 	if strings.TrimSpace(gamePath) == "" {
@@ -3418,7 +4614,7 @@ func (a *App) InstallOptiScaler(gamePath string) PatchResult {
 		}
 	}
 
-	targetDir, _, _, detectedAPI, err := a.resolveGameTarget(gamePath)
+	targetDir, _, _, detectedAPI, err := a.resolveGameTargetWithExe(gamePath, preferExe)
 	if err != nil {
 		return PatchResult{Success: false, Message: err.Error()}
 	}
@@ -3671,15 +4867,23 @@ func (a *App) detectInstalledMode(gamePath string) string {
 			}
 		}
 	}
-	// ReShade markers must be patcher-owned add-on files. renodx-dlss5.addon64
-	// is always deployed by InstallDLSS5, so its presence proves the patcher's
-	// ReShade install is still in place (residual ReShade.ini / reshade-shaders
-	// from the game itself are NOT treated as "installed").
+	// ReShade markers must be patcher-owned add-on files. The neural consumer
+	// add-on (either set) is always deployed by InstallDLSS5, so its presence
+	// proves the patcher's ReShade install is still in place (residual
+	// ReShade.ini / reshade-shaders from the game itself are NOT treated as
+	// "installed").
 	for _, dir := range allDirs {
 		if _, err := os.Stat(filepath.Join(dir, "renodx-dlss5.addon64")); err == nil {
 			return "reshade"
 		}
+		if _, err := os.Stat(filepath.Join(dir, "deep-fried-chicken.addon64")); err == nil {
+			return "reshade"
+		}
 		if _, err := os.Stat(filepath.Join(dir, "dlss5-feed.addon64")); err == nil {
+			return "reshade"
+		}
+		// DLSS5-Feeder 32-bit route marker (feeder is part of ReShade mode).
+		if _, err := os.Stat(filepath.Join(dir, "dlss5-feed.addon32")); err == nil {
 			return "reshade"
 		}
 	}
@@ -3688,6 +4892,16 @@ func (a *App) detectInstalledMode(gamePath string) string {
 
 // PatchGameWithMode performs the complete patch using the selected mode ("reshade" or "optiscaler")
 func (a *App) PatchGameWithMode(gamePath string, mode string) PatchResult {
+	return a.patchGameWithModeWithExe(gamePath, mode, "")
+}
+
+// PatchGameWithModeForExe is PatchGameWithMode with a manually picked target
+// executable (from the preview picker); an invalid exe falls back to auto.
+func (a *App) PatchGameWithModeForExe(gamePath string, mode string, exePath string) PatchResult {
+	return a.patchGameWithModeWithExe(gamePath, mode, exePath)
+}
+
+func (a *App) patchGameWithModeWithExe(gamePath string, mode string, preferExe string) PatchResult {
 	writeLog(fmt.Sprintf("=== PatchGameWithMode: Starting patch process for %s (mode: %s) ===", gamePath, mode))
 
 	if strings.TrimSpace(gamePath) == "" {
@@ -3725,6 +4939,19 @@ func (a *App) PatchGameWithMode(gamePath string, mode string) PatchResult {
 		}
 	}
 
+	// OptiScaler hooks DXGI/D3D11/D3D12/Vulkan only — on D3D8/D3D9 its proxy
+	// never loads, so the patch would "succeed" while doing nothing. Refuse
+	// upfront (before touching the disk) instead of faking success.
+	if mode == "optiscaler" {
+		if _, _, _, detectedAPI, apiErr := a.resolveGameTargetWithExe(gamePath, preferExe); apiErr == nil && (detectedAPI == "d3d9" || detectedAPI == "d3d8") {
+			writeLog("PatchGameWithMode: BLOCKED - OptiScaler does not support " + detectedAPI)
+			return PatchResult{
+				Success: false,
+				Message: "OptiScaler does not support " + strings.ToUpper(detectedAPI) + " games (its proxy never loads there). Use the ReShade method for this game.",
+			}
+		}
+	}
+
 	writeLog("PatchGameWithMode: Step 1 - Backing up original files")
 	a.emitPatchStatus("Backing up original game files...")
 	backupResult := a.BackupOriginalFiles(gamePath)
@@ -3734,25 +4961,103 @@ func (a *App) PatchGameWithMode(gamePath string, mode string) PatchResult {
 
 	if mode == "optiscaler" {
 		writeLog("PatchGameWithMode: Step 2 - Installing OptiScaler")
-		result := a.InstallOptiScaler(gamePath)
+		result := a.installOptiScalerWithExe(gamePath, preferExe)
 		if !result.Success {
 			writeLog("PatchGameWithMode: FAILED - OptiScaler installation failed: " + result.Message)
 			return result
 		}
 	} else {
+		// Direct3D 9 games have no ReShade add-on / DLSS path of their own.
+		// Bridge them to modern Direct3D with dgVoodoo2 first (output backend
+		// from Settings: D3D11 by default), then install ReShade for the
+		// bridge's output and DLSS 5 on top.
+		bridgeNote := ""
+		reshadeAPI := ""
+		dlssNote := ""
+		patchBridgeDir, patchExeForBitness, _, detectedAPI, apiErr := a.resolveGameTargetWithExe(gamePath, preferExe)
+		// 32-bit processes cannot load the 64-bit neural stack in-process;
+		// they take the DLSS5-Feeder route (addon32 + host64 helper) instead.
+		// NOTE: resolveGameTargetWithExe returns
+		// (targetDir, targetExe, launchExe, api), so the bitness probe must
+		// run against the SECOND value (the exe), never the directory.
+		is32Target := apiErr == nil && patchExeForBitness != "" && is32BitExe(patchExeForBitness)
+		// ReShade cannot hook Direct3D 8 at all, so D3D8 games ride the same
+		// dgVoodoo bridge as D3D9 ones.
+		if apiErr == nil && (detectedAPI == "d3d9" || detectedAPI == "d3d8") {
+			// The dgVoodoo2 bridge is quarantined on sight without an
+			// exclusion — enforce the game-folder exclusion FIRST, before a
+			// single bridge file touches the disk. Exclusions are recursive,
+			// so covering the game root protects every hook directory.
+			gameRoot := filepath.Clean(gamePath)
+			if st, statErr := os.Stat(gameRoot); statErr == nil && !st.IsDir() {
+				gameRoot = filepath.Dir(gameRoot)
+			}
+			writeLog("PatchGameWithMode: D3D9 detected - ensuring Defender exclusion for " + gameRoot)
+			a.emitPatchStatus("Ensuring Windows Defender exclusion for the game folder...")
+			if exclErr := ensureDefenderExcluded(gameRoot); exclErr != nil {
+				writeLog("PatchGameWithMode: BLOCKED - game folder exclusion failed: " + exclErr.Error())
+				return PatchResult{
+					Success: false,
+					Message: "Patch blocked: the game folder must be excluded from Windows Defender first (dgVoodoo2 is quarantined otherwise). " + exclErr.Error(),
+				}
+			}
+			writeLog(fmt.Sprintf("PatchGameWithMode: D3D9 detected - installing dgVoodoo2 D3D9 -> %s bridge", dgvoodooOutputLabel()))
+			a.emitPatchStatus(fmt.Sprintf("D3D9 detected - installing dgVoodoo2 bridge (D3D9 -> %s)...", dgvoodooOutputLabel()))
+			dgvResult := a.installDgVoodooWithExe(gamePath, preferExe)
+			if !dgvResult.Success {
+				writeLog("PatchGameWithMode: FAILED - dgVoodoo2 installation failed: " + dgvResult.Message)
+				return dgvResult
+			}
+			// ReShade hooks the bridge through dxgi.dll (the swapchain layer),
+			// never the wrapped API name that dgVoodoo owns — and dxgi covers
+			// both the D3D11 and the D3D12 output backends.
+			// Migration from the older d3d11-hook scheme: drop our stale
+			// d3d11.dll ReShade hook (if any) so two hooks never load at once.
+			// A game-shipped d3d11.dll is recorded as pre-existing and survives.
+			staleHook := filepath.Join(patchBridgeDir, "d3d11.dll")
+			if _, err := os.Stat(staleHook); err == nil && !a.preExistingFiles[strings.ToLower(staleHook)] && isAddonCapableReShade(staleHook) {
+				writeLog("PatchGameWithMode: removing stale d3d11 ReShade hook before dxgi install: " + staleHook)
+				_ = cleanDLL(staleHook)
+			}
+			reshadeAPI = "dxgi"
+			bridgeNote = fmt.Sprintf(" (%s -> %s via dgVoodoo2)", strings.ToUpper(detectedAPI), dgvoodooOutputLabel())
+		}
+
 		writeLog("PatchGameWithMode: Step 2 - Installing ReShade")
-		result := a.InstallReshade(gamePath)
+		result := a.installReshadeWithExe(gamePath, reshadeAPI, preferExe)
 		if !result.Success {
 			writeLog("PatchGameWithMode: FAILED - ReShade installation failed: " + result.Message)
 			return result
 		}
 
-		writeLog("PatchGameWithMode: Step 3 - Installing DLSS 5 files")
-		result = a.InstallDLSS5(gamePath)
-		if !result.Success {
-			writeLog("PatchGameWithMode: FAILED - DLSS 5 installation failed: " + result.Message)
-			return result
+		if is32Target {
+			writeLog("PatchGameWithMode: Step 3 - Installing DLSS5-Feeder 32-bit route")
+			result = a.installFeeder32WithExe(gamePath, preferExe)
+			if !result.Success {
+				writeLog("PatchGameWithMode: FAILED - DLSS5-Feeder installation failed: " + result.Message)
+				return result
+			}
+			dlssNote = " + feeder 32-bit (addon32 + host64)"
+		} else {
+			writeLog("PatchGameWithMode: Step 3 - Installing DLSS 5 files")
+			result = a.installDLSS5WithExe(gamePath, preferExe)
+			if !result.Success {
+				writeLog("PatchGameWithMode: FAILED - DLSS 5 installation failed: " + result.Message)
+				return result
+			}
 		}
+
+		writeLog("=== PatchGameWithMode: Patch process completed successfully ===")
+		// Post-patch verify (DLSS5-Feeder checks): auto-repair what the tool
+		// can fix (missing files, strays, old d3dcompiler), warn about what
+		// needs the user (e.g. NVIDIA driver below 616.56).
+		verifySuffix, blocking := a.verifyAndRepairAfterPatch(gamePath, preferExe)
+		baseMsg := "Patch applied successfully (" + mode + ")" + bridgeNote + dlssNote + "!" + verifySuffix
+		if blocking {
+			writeLog("PatchGameWithMode: COMPLETED WITH BLOCKING VERIFY FAILURES: " + verifySuffix)
+			return PatchResult{Success: false, Message: baseMsg}
+		}
+		return PatchResult{Success: true, Message: baseMsg}
 	}
 
 	writeLog("=== PatchGameWithMode: Patch process completed successfully ===")
@@ -3762,7 +5067,7 @@ func (a *App) PatchGameWithMode(gamePath string, mode string) PatchResult {
 // backupDefaultConfig is a small helper that remembers a config file for
 // uninstall cleanup (files that exist at install time are never deleted there)
 func backupDefaultConfig(dir string, entries map[string]bool) {
-	for _, name := range []string{"ReShade.ini", "ReShade.log", "ReShade.log1", "ReShadePreset.ini", "dlss5-feed.cfg", "dlss5-feed.log", "reshade-shaders", "dxgi.dll"} {
+	for _, name := range []string{"ReShade.ini", "ReShade.log", "ReShade.log1", "ReShadePreset.ini", "dlss5-feed.cfg", "dlss5-feed.log", "reshade-shaders", "dxgi.dll", "dgVoodoo.conf"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			entries[strings.ToLower(filepath.Join(dir, name))] = true
 		}
@@ -3777,6 +5082,7 @@ func (a *App) BackupOriginalFiles(gamePath string) PatchResult {
 
 	targetDirs := a.findAllTargetDirs(gamePath)
 	filesToBackup := []string{
+		"d3d8.dll",
 		"d3d9.dll",
 		"d3d10.dll",
 		"d3d11.dll",
@@ -3786,6 +5092,7 @@ func (a *App) BackupOriginalFiles(gamePath string) PatchResult {
 		"ddraw.dll",
 		"nvngx_dlss.dll",
 		"nvngx_dlssnr.dll",
+		"dgVoodoo.conf",
 	}
 
 	backedUpTotal := 0
@@ -3795,13 +5102,18 @@ func (a *App) BackupOriginalFiles(gamePath string) PatchResult {
 		if strings.Contains(lowerDir, "backup") {
 			continue
 		}
+		// The host64 helper folder is created fresh by the patcher; there is
+		// nothing of the game's to back up inside it.
+		if isFeederHostDir(targetDir) {
+			continue
+		}
 
 		dirCount := 0
 		backupDir := filepath.Join(targetDir, ".dlss5_backup")
 		// Remember what already exists so uninstall never deletes a file the
 		// game shipped (the old code dropped pre-existing markers with a 0-file
 		// backup, leaving ReShade behind on the next run).
-		for _, name := range []string{"d3d9.dll", "d3d10.dll", "d3d11.dll", "d3d12.dll", "dxgi.dll", "opengl32.dll", "ddraw.dll", "nvngx_dlss.dll", "nvngx_dlssnr.dll"} {
+		for _, name := range []string{"d3d8.dll", "d3d9.dll", "d3d10.dll", "d3d11.dll", "d3d12.dll", "dxgi.dll", "opengl32.dll", "ddraw.dll", "nvngx_dlss.dll", "nvngx_dlssnr.dll", "dgVoodoo.conf"} {
 			if _, err := os.Stat(filepath.Join(targetDir, name)); err == nil {
 				a.preExistingFiles[strings.ToLower(filepath.Join(targetDir, name))] = true
 			}
@@ -3906,6 +5218,7 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 	writeLog(fmt.Sprintf("UninstallPatch: Found %d target directories to clean: %v", len(targetDirs), targetDirs))
 
 	filesToRemove := []string{
+		"d3d8.dll",
 		"d3d9.dll",
 		"d3d10.dll",
 		"d3d11.dll",
@@ -3928,12 +5241,16 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 		"dlss5-feed.log",
 		"renodx-dlss5.addon64",
 		"renodx-dlss5.addon32",
+		"deep-fried-chicken.addon64",
+		"deep-fried-chicken-nvngx.dll",
+		"deep-fried-chicken.cfg",
 		"OptiScaler.ini",
 		"OptiScaler.log",
 		"nvngx.dll_dlssnr.dll",
 		"nvngx.dll_dlssnr_rtx20.dll",
 		"Nvngx_dlssr.dll",
 		"Nvngx_dlssm.dll",
+		"dgVoodoo.conf",
 	}
 
 	// The DLSS 5 add-on / feed files are placed by this patcher and never
@@ -3947,6 +5264,9 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 		"dlss5-feed.log",
 		"renodx-dlss5.addon64",
 		"renodx-dlss5.addon32",
+		"deep-fried-chicken.addon64",
+		"deep-fried-chicken-nvngx.dll",
+		"deep-fried-chicken.cfg",
 	}
 
 	// ReShade-specific files and folders are treated as fully patcher/third
@@ -3971,6 +5291,10 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 		"reshade-shaders",
 		"ReShade",
 		"OptiScaler",
+		// DLSS5-Feeder Vulkan layer leftovers / manual-copy artifacts. No
+		// game ships these folder names, so they are safe to purge.
+		"layer-x86",
+		"layer-x64",
 	}
 
 	// Any ReShade hook DLL or add-on that the game shipped must never be
@@ -3997,6 +5321,21 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 	for _, dir := range targetDirs {
 		writeLog("UninstallPatch: Processing directory: " + dir)
 		a.emitPatchStatus("Processing folder: " + dir + "...")
+
+		// The host64 helper folder is owned end-to-end by the patcher (it is
+		// created fresh at install and skipped by BackupOriginalFiles), so it
+		// is removed wholesale here instead of going through the per-file
+		// protection logic below. The ReShade uninstaller must never run
+		// against the helper exe either.
+		if isFeederHostDir(dir) {
+			writeLog("UninstallPatch: Removing patcher host64 folder " + dir)
+			a.emitPatchStatus("Removing host64 helper folder...")
+			if err := os.RemoveAll(dir); err != nil {
+				writeLog("UninstallPatch: Failed to remove host64 folder: " + err.Error())
+				errors = append(errors, fmt.Sprintf("Failed to remove %s: %v", dir, err))
+			}
+			continue
+		}
 
 		if _, err := os.Stat(reshadeSetup); err == nil {
 			exes, _ := filepath.Glob(filepath.Join(dir, "*.exe"))
@@ -4036,6 +5375,14 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 						if name == "nvngx_dlss.dll" || name == "nvngx_dlssnr.dll" {
 							continue
 						}
+						// The dgVoodoo2 bridge (wrapper d3d8.dll/d3d9.dll +
+						// dgVoodoo.conf) is patcher-owned and is purged by the
+						// dedicated dgVoodoo cleanup below — never protect it
+						// here, or an empty-backup folder would keep the
+						// bridge behind.
+						if name == "d3d8.dll" || name == "d3d9.dll" || strings.EqualFold(name, "dgVoodoo.conf") {
+							continue
+						}
 						dirProtected[strings.ToLower(filepath.Join(dir, name))] = true
 					}
 					for _, name := range foldersToRemove {
@@ -4067,6 +5414,25 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 							writeLog(fmt.Sprintf("UninstallPatch: Restored %s", entry.Name()))
 						}
 					}
+				}
+			}
+		}
+
+		// The dgVoodoo2 bridge is patcher-owned: remove the wrapper DLL, but
+		// only when it really is dgVoodoo code AND the game did not ship its
+		// own (a shipped one was already restored from backup above and must
+		// survive). dgVoodoo.conf is handled by the generic removal loop
+		// below (protected only when it pre-existed).
+		a.emitPatchStatus("Removing dgVoodoo2 bridge files...")
+		for _, wrapper := range []string{"d3d9.dll", "d3d8.dll"} {
+			if dgvPath := filepath.Join(dir, wrapper); isDgVoodooDLL(dgvPath) {
+				if !a.preExistingFiles[strings.ToLower(dgvPath)] {
+					writeLog("UninstallPatch: Removing patcher dgVoodoo2 wrapper " + dgvPath)
+					if err := cleanDLL(dgvPath); err != nil {
+						writeLog(fmt.Sprintf("UninstallPatch: Failed to remove dgVoodoo wrapper %s: %v", dgvPath, err))
+					}
+				} else {
+					writeLog("UninstallPatch: Keeping pre-existing " + wrapper + " at " + dgvPath)
 				}
 			}
 		}
@@ -4145,6 +5511,801 @@ func (a *App) UninstallPatch(gamePath string) PatchResult {
 	return PatchResult{Success: true, Message: "ReShade and DLSS 5 uninstalled successfully!"}
 }
 
+// ---------------------------------------------------------------------------
+// Verify engine — Go port of the DLSS5-Feeder Verify-DLSS5Feeder.ps1 checks.
+//
+// verifyInstallWithExe inspects a patched game folder read-only and reports
+// one VerifyCheck per area (exe/API, ReShade, feeder files, neural consumer,
+// NGX runtimes, d3dcompiler trap, GPU driver, preset). repairInstallWithExe
+// runs the same checks, auto-fixes everything the tool can fix itself
+// (missing files are copied from the local data sets, strays are moved,
+// an old d3dcompiler is renamed aside), and re-verifies. Things that need
+// the user (notably an NVIDIA driver below the minimum) are returned as
+// warnings, never silently fixed.
+// ---------------------------------------------------------------------------
+
+// minNvidiaDriverVersion is the minimum NVIDIA driver for neural rendering,
+// as reported by Verify-DLSS5Feeder.ps1 ("Minimum for neural rendering is
+// 616.56"). Compared against the nvidia-smi style driver version.
+const minNvidiaDriverVersion = "616.56"
+
+// VerifyCheck is a single verify result row.
+type VerifyCheck struct {
+	Name      string `json:"name"`
+	Status    string `json:"status"` // "ok", "warn" or "fail"
+	Detail    string `json:"detail"`
+	Fix       string `json:"fix"`
+	AutoFixed bool   `json:"autoFixed"`
+}
+
+// VerifyReport is the full verify/repair outcome for one game.
+type VerifyReport struct {
+	Success   bool          `json:"success"`
+	GamePath  string        `json:"gamePath"`
+	ExePath   string        `json:"exePath"`
+	TargetDir string        `json:"targetDir"`
+	Is32Bit   bool          `json:"is32Bit"`
+	API       string        `json:"api"`
+	Checks    []VerifyCheck `json:"checks"`
+	AutoFixed []string      `json:"autoFixed"`
+	Summary   string        `json:"summary"`
+}
+
+// HasFailures reports whether any check failed.
+func (r VerifyReport) HasFailures() bool {
+	for _, c := range r.Checks {
+		if c.Status == "fail" {
+			return true
+		}
+	}
+	return false
+}
+
+// counts tallies ok/warn/fail checks.
+func (r VerifyReport) counts() (ok, warn, fail int) {
+	for _, c := range r.Checks {
+		switch c.Status {
+		case "ok":
+			ok++
+		case "warn":
+			warn++
+		case "fail":
+			fail++
+		}
+	}
+	return ok, warn, fail
+}
+
+// SummarySuffix renders a compact human-readable verify digest for patch
+// result messages ("Verify: 12 OK, 2 warnings, 0 failures. ...").
+func (r VerifyReport) SummarySuffix() string {
+	ok, warn, fail := r.counts()
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Verify: %d OK, %d warnings, %d failures.", ok, warn, fail)
+	if len(r.AutoFixed) > 0 {
+		sb.WriteString(" Auto-fixed: " + strings.Join(r.AutoFixed, "; ") + ".")
+	}
+	for _, c := range r.Checks {
+		if c.Status == "fail" {
+			sb.WriteString(" [FAIL] " + c.Name)
+			if c.Fix != "" {
+				sb.WriteString(" -> " + c.Fix)
+			}
+			sb.WriteString(".")
+		}
+	}
+	for _, c := range r.Checks {
+		if c.Status == "warn" {
+			sb.WriteString(" [WARN] " + c.Name + ".")
+		}
+	}
+	return sb.String()
+}
+
+// compareDottedVersion compares two dotted numeric versions ("616.56").
+// Returns -1, 0 or +1. Non-numeric suffixes are ignored.
+func compareDottedVersion(a, b string) int {
+	numPrefix := func(s string) int {
+		n := 0
+		for _, r := range s {
+			if r < '0' || r > '9' {
+				break
+			}
+			n = n*10 + int(r-'0')
+		}
+		return n
+	}
+	pa := strings.Split(strings.TrimSpace(a), ".")
+	pb := strings.Split(strings.TrimSpace(b), ".")
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		var va, vb int
+		if i < len(pa) {
+			va = numPrefix(pa[i])
+		}
+		if i < len(pb) {
+			vb = numPrefix(pb[i])
+		}
+		if va < vb {
+			return -1
+		}
+		if va > vb {
+			return 1
+		}
+	}
+	return 0
+}
+
+// isSmiStyleDriver reports whether v looks like an nvidia-smi driver version
+// ("616.56", "576.52") as opposed to the WMI/registry form ("32.0.15.7652").
+func isSmiStyleDriver(v string) bool {
+	parts := strings.Split(strings.TrimSpace(v), ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major := 0
+	for _, r := range parts[0] {
+		if r < '0' || r > '9' {
+			return false
+		}
+		major = major*10 + int(r-'0')
+	}
+	return major >= 100
+}
+
+// getNvidiaDriverVersion returns the installed NVIDIA driver version,
+// preferring nvidia-smi (exact "616.56" style). Falls back to the display
+// adapter registry keys and CIM. Returns "" when it cannot be determined.
+func getNvidiaDriverVersion() (string, string) {
+	if out, err := exec.Command("nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader").CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if v := strings.Fields(line)[0]; regexp.MustCompile(`^\d+\.\d+`).MatchString(v) {
+				return v, "nvidia-smi"
+			}
+		}
+	}
+	// Registry fallback: display adapter class, NVIDIA entries only.
+	const adapterClass = `SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}`
+	for i := 0; i < 16; i++ {
+		k, err := registry.OpenKey(registry.LOCAL_MACHINE, fmt.Sprintf(`%s\%04d`, adapterClass, i), registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		desc, _, errDesc := k.GetStringValue("DriverDesc")
+		ver, _, errVer := k.GetStringValue("DriverVersion")
+		_ = k.Close()
+		if errDesc != nil || errVer != nil || ver == "" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(desc), "nvidia") {
+			return strings.TrimSpace(ver), "registry"
+		}
+	}
+	// CIM fallback (same WMI-style version space as the registry).
+	if out, err := runPowerShell("-Command", "(Get-CimInstance Win32_VideoController | Where-Object {$_.Name -match 'NVIDIA'} | Select-Object -First 1 -ExpandProperty DriverVersion)"); err == nil && out != "" {
+		if v := strings.Fields(out)[0]; regexp.MustCompile(`^\d+\.\d+`).MatchString(v) {
+			return v, "cim"
+		}
+	}
+	return "", ""
+}
+
+// findFileCI locates a file in dir case-insensitively. Returns "" when absent.
+func findFileCI(dir, name string) string {
+	if p := filepath.Join(dir, name); fileExists(p) {
+		return p
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if strings.EqualFold(e.Name(), name) {
+			return filepath.Join(dir, e.Name())
+		}
+	}
+	return ""
+}
+
+// findFileUnder searches root recursively (bounded depth) for name,
+// case-insensitively. Returns "" when absent.
+func findFileUnder(root, name string, maxDepth int) string {
+	var hit string
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || hit != "" {
+			return nil
+		}
+		if info.IsDir() {
+			if rel, rerr := filepath.Rel(root, path); rerr == nil && rel != "." && len(strings.Split(rel, string(os.PathSeparator))) > maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.EqualFold(info.Name(), name) {
+			hit = path
+		}
+		return nil
+	})
+	return hit
+}
+
+// hookIs32Bit reports whether a hook DLL is a 32-bit image (manual header
+// read first, same reason as is32BitExe).
+func hookIs32Bit(path string) bool {
+	if m, err := peMachineType(path); err == nil {
+		return m == pe.IMAGE_FILE_MACHINE_I386
+	}
+	f, err := pe.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	return f.Machine == pe.IMAGE_FILE_MACHINE_I386
+}
+
+// reshadeVersionOK reports whether a ReShade version string is >= 6.8
+// (the RESHADE_API_VERSION 20 builds the feeder needs).
+func reshadeVersionOK(ver string) bool {
+	m := regexp.MustCompile(`^\s*(\d+)\.(\d+)`).FindStringSubmatch(ver)
+	if len(m) != 3 {
+		return false
+	}
+	major, minor := 0, 0
+	fmt.Sscanf(m[1], "%d", &major)
+	fmt.Sscanf(m[2], "%d", &minor)
+	return major > 6 || (major == 6 && minor >= 8)
+}
+
+// feederShaderSource resolves the DLSS5_Feed.fx payload, preferring the
+// feeder release (same build as the add-on) over the reshade data set.
+func feederShaderSource() string {
+	if p := feederFile(filepath.Join("reshade-shaders", "Shaders", "DLSS5_Feed.fx")); p != "" {
+		return p
+	}
+	if p := filepath.Join(dataDir("reshade"), "reshade-shaders-source", "Shaders", "DLSS5_Feed.fx"); fileExists(p) {
+		return p
+	}
+	return ""
+}
+
+// feederAddonSource resolves the feeder add-on matching the game's bitness,
+// preferring the feeder release so the add-on and shader stay one build.
+func feederAddonSource(is32 bool) string {
+	if is32 {
+		if p := feederFile("dlss5-feed.addon32"); p != "" {
+			return p
+		}
+		return ""
+	}
+	if p := feederFile("dlss5-feed.addon64"); p != "" {
+		return p
+	}
+	return dlssFile("dlss5-feed.addon64")
+}
+
+// verifyInstallWithExe is the read-only verify pass. preferExe selects a
+// manually picked target executable ("" = auto-detect).
+func (a *App) verifyInstallWithExe(gamePath, preferExe string) VerifyReport {
+	rep := VerifyReport{GamePath: gamePath, Checks: []VerifyCheck{}}
+	add := func(status, name, detail, fix string) {
+		rep.Checks = append(rep.Checks, VerifyCheck{Name: name, Status: status, Detail: detail, Fix: fix})
+	}
+
+	targetDir, targetExe, _, api, err := a.resolveGameTargetWithExe(gamePath, preferExe)
+	if err != nil || targetExe == "" {
+		msg := "cannot resolve game executable"
+		if err != nil {
+			msg = err.Error()
+		}
+		add("fail", "Game executable", msg, "Re-browse the game's real .exe (not a launcher).")
+		rep.Summary = rep.SummarySuffix()
+		return rep
+	}
+	rep.TargetDir, rep.ExePath, rep.API = targetDir, targetExe, api
+	is32 := is32BitExe(targetExe)
+	rep.Is32Bit = is32
+	consumerDir := targetDir
+	consumerWhere := "game folder"
+	if is32 {
+		consumerDir = filepath.Join(targetDir, feederHostDir)
+		consumerWhere = "host64\\"
+	}
+
+	// 1. Executable + architecture.
+	if st, serr := os.Stat(targetExe); serr == nil {
+		bits := "64-bit"
+		if is32 {
+			bits = "32-bit"
+		}
+		add("ok", "Game executable", filepath.Base(targetExe)+" ("+bits+", "+formatBytes(st.Size())+")", "")
+	} else {
+		add("fail", "Game executable", "target exe not found: "+targetExe, "Re-browse the game's real .exe.")
+	}
+
+	// 2. Render API / dgVoodoo2 bridge for DX8/DX9.
+	bridged := api == "d3d9" || api == "d3d8"
+	if bridged {
+		wrapper := "d3d9.dll"
+		if api == "d3d8" {
+			wrapper = "d3d8.dll"
+		}
+		wp := findFileCI(targetDir, wrapper)
+		conf := findFileCI(targetDir, "dgVoodoo.conf")
+		switch {
+		case wp == "" || conf == "":
+			add("fail", "dgVoodoo2 bridge", "Direct3D "+strings.ToUpper(api[3:])+" game but the dgVoodoo2 "+wrapper+" bridge / dgVoodoo.conf is missing in "+targetDir+".", "Re-run Patch so the dgVoodoo2 "+strings.ToUpper(api)+" -> "+dgvoodooOutputLabel()+" bridge is installed.")
+		case !isDgVoodooDLL(wp):
+			add("fail", "dgVoodoo2 bridge", wp+" is not a dgVoodoo2 wrapper (game-shipped or foreign file owns the name).", "Restore the game's own "+wrapper+" from .dlss5_backup and re-patch to install the real bridge.")
+		default:
+			add("ok", "Render API", "Direct3D "+strings.ToUpper(api[3:])+" via dgVoodoo2 (translated to "+dgvoodooOutputLabel()+")", "")
+		}
+	} else {
+		add("ok", "Render API", api+" ("+targetExe+")", "")
+	}
+
+	// 3. ReShade hook: present, add-on capable, >= 6.8, bitness matches.
+	hookPath, hookVer, hookAddon := getReshadeInfo(targetDir)
+	if hookPath == "" {
+		// Distinguish "foreign dxgi.dll, no ReShade at all" for a better hint.
+		add("fail", "ReShade hook", "No add-on capable ReShade hook (dxgi.dll/d3d11.dll/...) in "+targetDir+".", "Re-run Patch to install the ReShade add-on build.")
+	} else {
+		switch {
+		case !hookAddon:
+			add("fail", "ReShade hook", filepath.Base(hookPath)+" has only limited add-on functionality.", "Re-run Patch to replace it with the add-on build.")
+		case hookVer == "":
+			add("warn", "ReShade hook", filepath.Base(hookPath)+" version unreadable.", "")
+		case !reshadeVersionOK(hookVer):
+			add("fail", "ReShade hook", filepath.Base(hookPath)+" is "+hookVer+" — the feeder needs 6.8+.", "Re-run Patch to install ReShade 6.8+ with add-on support.")
+		default:
+			add("ok", "ReShade hook", filepath.Base(hookPath)+": "+hookVer, "")
+		}
+		if hookIs32Bit(hookPath) != is32 {
+			want := "64-bit"
+			if is32 {
+				want = "32-bit"
+			}
+			add("fail", "ReShade bitness", filepath.Base(hookPath)+" bitness does not match the "+want+" game.", "Re-run Patch so the "+want+" ReShade hook is deployed.")
+		}
+	}
+	if findFileCI(targetDir, "ReShade.ini") == "" {
+		add("warn", "ReShade.ini", "ReShade.ini missing in "+targetDir+".", "Re-run Patch or Repair to regenerate it.")
+	} else {
+		add("ok", "ReShade.ini", "present", "")
+	}
+
+	// 4. Feeder add-on matching the game's bitness, next to the game exe.
+	addonName := "dlss5-feed.addon64"
+	if is32 {
+		addonName = "dlss5-feed.addon32"
+	}
+	if findFileCI(targetDir, addonName) == "" {
+		add("fail", "DLSS5-Feeder add-on", addonName+" missing in "+targetDir+".", "Copy "+addonName+" into the game folder (Repair does this).")
+	} else {
+		add("ok", "DLSS5-Feeder add-on", addonName+" present", "")
+	}
+	if is32 {
+		if stray := findFileCI(targetDir, "dlss5-feed.addon64"); stray != "" {
+			add("warn", "Stray 64-bit feeder add-on", "dlss5-feed.addon64 beside a 32-bit exe is never loaded.", "Remove it; only dlss5-feed.addon32 belongs here.")
+		}
+	}
+
+	// 5. host64 helper for 32-bit games.
+	if is32 {
+		hostExe := filepath.Join(consumerDir, "dlss5-feed-host64.exe")
+		if !fileExists(hostExe) {
+			if _, derr := os.Stat(consumerDir); os.IsNotExist(derr) {
+				add("fail", "host64 helper", "host64\\ does not exist — nowhere for the 64-bit side to live.", "Create host64\\ and deploy dlss5-feed-host64.exe + consumer + NGX runtimes there (Repair does this).")
+			} else {
+				add("fail", "host64 helper", "host64\\dlss5-feed-host64.exe missing — the x86 add-on cannot talk to NGX without it.", "Copy dlss5-feed-host64.exe into host64\\ (Repair does this).")
+			}
+		} else {
+			add("ok", "host64 helper", "host64\\dlss5-feed-host64.exe present", "")
+			if hook := findFileCI(consumerDir, "dxgi.dll"); hook == "" {
+				add("fail", "host64 ReShade", "No dxgi.dll (64-bit ReShade) in host64\\ — the helper has no render hook.", "Copy the 64-bit add-on ReShade as host64\\dxgi.dll (Repair does this).")
+			} else if !isAddonCapableReShade(hook) {
+				add("fail", "host64 ReShade", "host64\\dxgi.dll is not the add-on build.", "Replace host64\\dxgi.dll with the 64-bit add-on ReShade (Repair does this).")
+			} else {
+				add("ok", "host64 ReShade", "host64\\dxgi.dll present (add-on build)", "")
+			}
+		}
+	}
+
+	// 6. Feed shader + framework headers.
+	if fx := findFileUnder(filepath.Join(targetDir, "reshade-shaders"), "DLSS5_Feed.fx", 3); fx == "" {
+		add("fail", "Feed shader", "reshade-shaders\\Shaders\\DLSS5_Feed.fx missing — the effect that feeds the add-on.", "Copy DLSS5_Feed.fx into reshade-shaders\\Shaders\\ (Repair does this).")
+	} else {
+		add("ok", "Feed shader", "DLSS5_Feed.fx present", "")
+	}
+	var missingHeaders []string
+	for _, h := range []string{"ReShade.fxh", "ReShadeUI.fxh", "DrawText.fxh"} {
+		if findFileUnder(filepath.Join(targetDir, "reshade-shaders"), h, 3) == "" {
+			missingHeaders = append(missingHeaders, h)
+		}
+	}
+	if len(missingHeaders) > 0 {
+		add("warn", "Shader headers", "Missing framework header(s): "+strings.Join(missingHeaders, ", "), "Copy the missing .fxh files into reshade-shaders\\Shaders\\.")
+	} else {
+		add("ok", "Shader headers", "ReShade.fxh, ReShadeUI.fxh, DrawText.fxh present", "")
+	}
+
+	// 7. Neural consumer in the folder where 64-bit code runs.
+	dfc := findFileCI(consumerDir, "deep-fried-chicken.addon64")
+	reno := findFileCI(consumerDir, "renodx-dlss5.addon64")
+	if is32 {
+		for _, n := range []string{"deep-fried-chicken.addon64", "renodx-dlss5.addon64"} {
+			if stray := findFileCI(targetDir, n); stray != "" {
+				add("fail", "Neural consumer location", n+" is next to the 32-bit exe — wrong place, never loaded.", "Move "+n+" into "+consumerDir+" (Repair does this).")
+			}
+		}
+	}
+	switch {
+	case dfc != "" && reno != "":
+		add("fail", "Neural consumer", "BOTH Deep Fried Chicken and renodx-dlss5.addon64 are in "+consumerWhere+" — they fight each other.", "Remove one of them (keep deep-fried-chicken.addon64 unless you specifically want RenoDX).")
+	case dfc != "":
+		add("ok", "Neural consumer", "deep-fried-chicken.addon64 in "+consumerWhere, "")
+		if findFileCI(consumerDir, "deep-fried-chicken-nvngx.dll") == "" {
+			add("fail", "Chicken NGX bridge", "deep-fried-chicken-nvngx.dll missing in "+consumerWhere+" — Chicken cannot attach without it.", "Copy deep-fried-chicken-nvngx.dll into "+consumerDir+".")
+		} else {
+			add("ok", "Chicken NGX bridge", "deep-fried-chicken-nvngx.dll present", "")
+		}
+	case reno != "":
+		add("ok", "Neural consumer", "renodx-dlss5.addon64 in "+consumerWhere+" (supported alternative)", "")
+	default:
+		add("fail", "Neural consumer", "No neural consumer in "+consumerDir+" — nothing acts on the feeder's contract.", "Copy deep-fried-chicken.addon64 (recommended) or renodx-dlss5.addon64 into "+consumerDir+" (Repair installs "+consumerAddonName(neuralConsumer())+").")
+	}
+	// Flag a consumer that no longer matches Settings (user switched after
+	// patching): works fine, but re-patch to actually switch the files.
+	installedSel := ""
+	if dfc != "" {
+		installedSel = "dfc"
+	} else if reno != "" {
+		installedSel = "renodx"
+	}
+	if installedSel != "" && installedSel != neuralConsumer() {
+		want := "renodx-dlss5.addon64"
+		if neuralConsumer() == "dfc" {
+			want = "deep-fried-chicken.addon64 (+ bridge + cfg)"
+		}
+		add("warn", "Neural consumer selection", "Installed consumer differs from Settings ("+want+").", "Re-patch to switch the deployed files, or change Settings > Neural consumer back.")
+	}
+	if bridge := findFileCI(consumerDir, "dlss5-dx11-bridge.addon64"); bridge != "" {
+		add("fail", "Conflicting bridge", "dlss5-dx11-bridge.addon64 must never be combined with DLSS5-Feeder.", "Delete dlss5-dx11-bridge.addon64 from "+consumerDir+" (Repair does this).")
+	}
+
+	// 8. NVIDIA NGX runtimes beside the consumer.
+	for _, n := range []string{"nvngx_dlssnr.dll", "nvngx_dlss.dll"} {
+		if p := findFileCI(consumerDir, n); p == "" {
+			why := "the DLSS super-resolution runtime the consumer expects beside the NR model"
+			if n == "nvngx_dlssnr.dll" {
+				why = "the neural-rendering model itself — DLSS 5 cannot run without it"
+			}
+			add("fail", "NGX runtime "+n, n+" missing from "+consumerWhere+" ("+why+").", "Copy "+n+" into "+consumerDir+" (Repair does this).")
+		} else if v := getDLLFileVersion(p); v != "" {
+			add("ok", "NGX runtime "+n, n+": "+v, "")
+		} else {
+			add("ok", "NGX runtime "+n, n+" present", "")
+		}
+	}
+
+	// 9. d3dcompiler_47.dll trap: a Win8.1-era copy wins the search order and
+	// silently kills the neural pass (cs_5_1 unknown there).
+	for _, dc := range []struct{ dir, label string }{{targetDir, "game folder"}, {consumerDir, "host64\\"}} {
+		if dc.dir == targetDir || is32 {
+			if p := findFileCI(dc.dir, "d3dcompiler_47.dll"); p != "" {
+				if v := getDLLFileVersion(p); v != "" && strings.HasPrefix(v, "6.3.") {
+					add("fail", "d3dcompiler_47.dll ("+dc.label+")", "Windows 8.1-era d3dcompiler_47.dll ("+v+") — fails the neural pass every frame, silently.", "Delete or rename "+p+" so System32's copy is used (Repair renames it aside).")
+				} else if v != "" {
+					add("ok", "d3dcompiler_47.dll ("+dc.label+")", v+" — new enough for cs_5_1", "")
+				} else {
+					add("warn", "d3dcompiler_47.dll ("+dc.label+")", "version unreadable — if it predates Shader Model 5.1 the neural pass fails silently.", "")
+				}
+			}
+		}
+	}
+	if !hasFailOrWarn(rep, "d3dcompiler_47.dll") {
+		add("ok", "d3dcompiler_47.dll", "No local copy — System32's is used, which is correct", "")
+	}
+
+	// 10. GPU + driver. Driver below the minimum is a USER action: warn, and
+	// keep the install itself successful.
+	nvidiaPresent := false
+	for _, g := range detectGPUs() {
+		if g.Vendor == "NVIDIA" {
+			nvidiaPresent = true
+			break
+		}
+	}
+	if !nvidiaPresent {
+		add("warn", "GPU", "No NVIDIA RTX adapter detected — DLSS/NGX needs an RTX card.", "Run the game on an NVIDIA RTX GPU.")
+	} else {
+		add("ok", "GPU", "NVIDIA RTX adapter found: "+detectGPU().Name, "")
+	}
+	if drv, src := getNvidiaDriverVersion(); drv == "" {
+		add("warn", "NVIDIA driver", "Driver version could not be determined ("+src+").", "Confirm the NVIDIA driver is "+minNvidiaDriverVersion+" or newer (minimum for neural rendering).")
+	} else if isSmiStyleDriver(drv) {
+		if compareDottedVersion(drv, minNvidiaDriverVersion) < 0 {
+			add("warn", "NVIDIA driver", "Driver "+drv+" is below the minimum "+minNvidiaDriverVersion+" for neural rendering.", "Update the NVIDIA driver to "+minNvidiaDriverVersion+" or newer (GeForce Experience / nvidia.com). This is a user step — the patcher cannot do it.")
+		} else {
+			add("ok", "NVIDIA driver", "Driver "+drv+" (minimum for neural rendering is "+minNvidiaDriverVersion+")", "")
+		}
+	} else {
+		add("warn", "NVIDIA driver", "Driver identifier "+drv+" ("+src+") is not comparable — assuming OK.", "If neural rendering stays inactive, update the NVIDIA driver to "+minNvidiaDriverVersion+"+.")
+	}
+
+	// 11. Preset: DLSS5_Feed enabled + motion-vector provider set.
+	presetPath := findFileCI(targetDir, "ReShadePreset.ini")
+	if presetPath == "" {
+		add("fail", "Preset", "ReShadePreset.ini missing — no technique is enabled and no provider is set.", "Re-run Patch or Repair to write the preset.")
+	} else if data, rerr := os.ReadFile(presetPath); rerr != nil {
+		add("warn", "Preset", "ReShadePreset.ini could not be read.", "")
+	} else {
+		text := string(data)
+		if !strings.Contains(text, "DLSS5_Feed") {
+			add("fail", "Preset", "DLSS5_Feed is not enabled in ReShadePreset.ini.", "Enable DLSS5_Feed in the ReShade overlay, or re-run Patch/Repair.")
+		} else {
+			add("ok", "Preset", "DLSS5_Feed is enabled", "")
+		}
+		iniText := ""
+		if iniData, ierr := os.ReadFile(findFileCI(targetDir, "ReShade.ini")); ierr == nil {
+			iniText = string(iniData)
+		}
+		if !regexp.MustCompile(`(?i)DLSS5_MV_PROVIDER\s*=\s*\d+`).MatchString(text) &&
+			!regexp.MustCompile(`(?i)DLSS5_MV_PROVIDER\s*=\s*\d+`).MatchString(iniText) {
+			add("warn", "Motion vectors", "DLSS5_MV_PROVIDER is not set — the feed runs with no motion vectors.", "Set the provider in the preset (Repair pins the bundled Launchpad provider).")
+		} else {
+			add("ok", "Motion vectors", "DLSS5_MV_PROVIDER is set", "")
+		}
+	}
+
+	rep.Success = !rep.HasFailures()
+	rep.Summary = rep.SummarySuffix()
+	writeLog(fmt.Sprintf("VerifyInstall: %s api=%s 32bit=%v -> %s", targetDir, api, is32, rep.Summary))
+	return rep
+}
+
+// hasFailOrWarn reports whether any check name contains substr with fail/warn.
+func hasFailOrWarn(rep VerifyReport, substr string) bool {
+	for _, c := range rep.Checks {
+		if strings.Contains(c.Name, substr) && c.Status != "ok" {
+			return true
+		}
+	}
+	return false
+}
+
+// formatBytes renders a byte count like the verify script ("60.3 MB").
+func formatBytes(n int64) string {
+	if n >= 1073741824 {
+		return fmt.Sprintf("%.1f GB", float64(n)/1073741824)
+	}
+	if n >= 1048576 {
+		return fmt.Sprintf("%.1f MB", float64(n)/1048576)
+	}
+	if n >= 1024 {
+		return fmt.Sprintf("%d KB", n/1024)
+	}
+	return fmt.Sprintf("%d B", n)
+}
+
+// copyFileTracked copies src to dst, creating the parent dir. Used by repair.
+func copyFileTracked(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	return copyFile(src, dst)
+}
+
+// ---------------------------------------------------------------------------
+// Repair — auto-fix every verify failure the tool can fix itself.
+// ---------------------------------------------------------------------------
+
+// repairInstallWithExe verifies, fixes what is tool-fixable, and re-verifies.
+// Driver warnings (and anything needing the user) are left as warnings.
+func (a *App) repairInstallWithExe(gamePath, preferExe string) VerifyReport {
+	rep := a.verifyInstallWithExe(gamePath, preferExe)
+	if !rep.HasFailures() {
+		return rep
+	}
+	targetDir, targetExe, _, api, err := a.resolveGameTargetWithExe(gamePath, preferExe)
+	if err != nil || targetExe == "" {
+		return rep
+	}
+	is32 := is32BitExe(targetExe)
+	consumerDir := targetDir
+	if is32 {
+		consumerDir = filepath.Join(targetDir, feederHostDir)
+	}
+	fixed := []string{}
+	markFixed := func(i int, what string) {
+		fixed = append(fixed, what)
+		rep.Checks[i].AutoFixed = true
+		writeLog("RepairInstall: fixed " + what)
+	}
+
+	native := a.gameHasNativeDLSSWithExe(gamePath, preferExe)
+	hookAPI := api
+	if api == "d3d9" || api == "d3d8" {
+		hookAPI = "dxgi"
+	}
+
+	for i, c := range rep.Checks {
+		// Fails are always repaired. Two warns carry a safe automatic fix
+		// (provider pin, stray unloadable add-on); everything else warn-level
+		// (driver, GPU, headers) needs the user or is cosmetic.
+		if c.Status == "ok" {
+			continue
+		}
+		if c.Status == "warn" && c.Name != "Motion vectors" && c.Name != "Stray 64-bit feeder add-on" {
+			continue
+		}
+		switch c.Name {
+		case "dgVoodoo2 bridge":
+			a.emitPatchStatus("Repair: installing dgVoodoo2 bridge...")
+			if r := a.installDgVoodooWithExe(gamePath, preferExe); r.Success {
+				markFixed(i, "dgVoodoo2 bridge installed")
+			}
+		case "ReShade hook", "ReShade bitness":
+			a.emitPatchStatus("Repair: restoring ReShade add-on hook...")
+			if r := a.copyReshadeFilesManually(targetDir, targetExe, hookAPI, native); r.Success {
+				markFixed(i, "ReShade add-on hook restored")
+			}
+		case "ReShade.ini":
+			a.emitPatchStatus("Repair: writing ReShade.ini...")
+			if a.ensureReshadeIni(targetDir, native) == nil {
+				ensureFeederMVProvider(targetDir)
+				markFixed(i, "ReShade.ini regenerated")
+			}
+		case "DLSS5-Feeder add-on":
+			addonName := "dlss5-feed.addon64"
+			if is32 {
+				addonName = "dlss5-feed.addon32"
+			}
+			if src := feederAddonSource(is32); src != "" {
+				a.emitPatchStatus("Repair: copying " + addonName + "...")
+				if copyFileTracked(src, filepath.Join(targetDir, addonName)) == nil {
+					markFixed(i, addonName+" deployed")
+				}
+			}
+		case "Stray 64-bit feeder add-on":
+			_ = cleanDLL(filepath.Join(targetDir, "dlss5-feed.addon64"))
+			markFixed(i, "stray dlss5-feed.addon64 removed")
+		case "host64 helper":
+			a.emitPatchStatus("Repair: deploying host64 helper...")
+			hostSrc := feederFile(filepath.Join(feederHostDir, "dlss5-feed-host64.exe"))
+			if hostSrc != "" && copyFileTracked(hostSrc, filepath.Join(consumerDir, "dlss5-feed-host64.exe")) == nil {
+				markFixed(i, "host64 helper deployed")
+			}
+		case "host64 ReShade":
+			if hook := a.reshade64Hook(); hook != "" && copyFileTracked(hook, filepath.Join(consumerDir, "dxgi.dll")) == nil {
+				markFixed(i, "host64 ReShade (dxgi.dll) deployed")
+			}
+		case "Feed shader":
+			if src := feederShaderSource(); src != "" && copyFileTracked(src, filepath.Join(targetDir, "reshade-shaders", "Shaders", "DLSS5_Feed.fx")) == nil {
+				ensureFeederMVProvider(targetDir)
+				markFixed(i, "DLSS5_Feed.fx deployed")
+			}
+		case "Neural consumer":
+			selFix := neuralConsumer()
+			removeUnselectedConsumer(consumerDir, selFix)
+			deployed := []string{}
+			for _, name := range consumerDeployFiles(selFix) {
+				if src := dlssFile(name); src != "" {
+					if copyFileTracked(src, filepath.Join(consumerDir, name)) == nil {
+						deployed = append(deployed, name)
+					}
+				}
+			}
+			if len(deployed) > 0 {
+				markFixed(i, strings.Join(deployed, ", ")+" deployed to "+consumerShort(consumerDir, targetDir))
+			}
+		case "Neural consumer location":
+			for _, n := range []string{"deep-fried-chicken.addon64", "renodx-dlss5.addon64"} {
+				if stray := findFileCI(targetDir, n); stray != "" {
+					dst := filepath.Join(consumerDir, n)
+					_ = os.MkdirAll(consumerDir, 0755)
+					if os.Rename(stray, dst) != nil {
+						_ = copyFileTracked(stray, dst)
+						_ = cleanDLL(stray)
+					}
+					markFixed(i, n+" moved to host64\\")
+					break
+				}
+			}
+		case "Conflicting bridge":
+			_ = cleanDLL(filepath.Join(consumerDir, "dlss5-dx11-bridge.addon64"))
+			markFixed(i, "conflicting dlss5-dx11-bridge removed")
+		case "Motion vectors":
+			a.emitPatchStatus("Repair: setting motion-vector provider...")
+			ensureFeederMVProvider(targetDir)
+			markFixed(i, "motion-vector provider pinned (Launchpad)")
+		default:
+			switch {
+			case strings.HasPrefix(c.Name, "NGX runtime "):
+				name := strings.TrimPrefix(c.Name, "NGX runtime ")
+				if src := dlssFile(name); src != "" && copyFileTracked(src, filepath.Join(consumerDir, name)) == nil {
+					markFixed(i, name+" deployed to "+consumerShort(consumerDir, targetDir))
+				}
+			case strings.HasPrefix(c.Name, "d3dcompiler_47.dll"):
+				for _, dir := range []string{targetDir, consumerDir} {
+					if p := findFileCI(dir, "d3dcompiler_47.dll"); p != "" {
+						if v := getDLLFileVersion(p); v != "" && strings.HasPrefix(v, "6.3.") {
+							if os.Rename(p, p+".dlss5_bak") == nil {
+								markFixed(i, "old d3dcompiler_47.dll renamed aside")
+							}
+						}
+					}
+				}
+			case c.Name == "Preset":
+				a.emitPatchStatus("Repair: writing ReShade preset...")
+				if a.ensureReshadePreset(targetDir, native) == nil {
+					ensureFeederMVProvider(targetDir)
+					markFixed(i, "ReShadePreset.ini regenerated")
+				}
+			}
+		}
+	}
+
+	// Re-run the read-only pass so the report reflects the repaired state,
+	// keeping the list of applied fixes for the message.
+	final := a.verifyInstallWithExe(gamePath, preferExe)
+	final.AutoFixed = append(rep.AutoFixed, fixed...)
+	final.Summary = final.SummarySuffix()
+	writeLog("RepairInstall: " + final.Summary)
+	return final
+}
+
+// consumerShort renders consumerDir as "host64\\" or "game folder".
+func consumerShort(consumerDir, targetDir string) string {
+	if consumerDir == targetDir {
+		return "game folder"
+	}
+	return "host64\\"
+}
+
+// verifyAndRepairAfterPatch runs the feeder verify checks after a patch,
+// auto-repairs what the tool can fix, and returns a message suffix plus
+// whether blocking failures remain.
+func (a *App) verifyAndRepairAfterPatch(gamePath, preferExe string) (string, bool) {
+	a.emitPatchStatus("Verifying installation (DLSS5-Feeder checks)...")
+	rep := a.verifyInstallWithExe(gamePath, preferExe)
+	if rep.HasFailures() {
+		a.emitPatchStatus("Verify found gaps — repairing missing files...")
+		writeLog("PatchGame: verify found failures, attempting auto-repair")
+		rep = a.repairInstallWithExe(gamePath, preferExe)
+	}
+	suffix := " " + rep.Summary
+	if rep.HasFailures() {
+		return suffix, true
+	}
+	return suffix, false
+}
+
+// VerifyInstall verifies a patched game (read-only). Exposed to the frontend.
+func (a *App) VerifyInstall(gamePath string) VerifyReport {
+	return a.verifyInstallWithExe(gamePath, "")
+}
+
+// VerifyInstallForExe verifies a patched game with a manually picked exe.
+func (a *App) VerifyInstallForExe(gamePath string, exePath string) VerifyReport {
+	return a.verifyInstallWithExe(gamePath, exePath)
+}
+
+// RepairInstall verifies and auto-fixes a patched game. Exposed to frontend.
+func (a *App) RepairInstall(gamePath string) VerifyReport {
+	return a.repairInstallWithExe(gamePath, "")
+}
+
+// RepairInstallForExe verifies and auto-fixes with a manually picked exe.
+func (a *App) RepairInstallForExe(gamePath string, exePath string) VerifyReport {
+	return a.repairInstallWithExe(gamePath, exePath)
+}
+
 // copyFile copies a single file
 func copyFile(src, dst string) error {
 	input, err := os.ReadFile(src)
@@ -4176,9 +6337,400 @@ func copyDir(src, dst string) error {
 	})
 }
 
+// --- Settings: Windows Defender exclusions + download URLs ---
+
+var (
+	modShell32      = syscall.NewLazyDLL("shell32.dll")
+	procIsUserAdmin = modShell32.NewProc("IsUserAnAdmin")
+)
+
+// isElevated reports whether this process runs with administrator rights.
+// Adding a Defender exclusion requires elevation, so the UI uses this to tell
+// the user a Windows permission (UAC) prompt is about to appear.
+func isElevated() bool {
+	ret, _, _ := procIsUserAdmin.Call()
+	return ret != 0
+}
+
+// runPowerShell runs a PowerShell 5.1 command and returns its trimmed output.
+func runPowerShell(args ...string) (string, error) {
+	full := append([]string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"}, args...)
+	cmd := exec.Command("powershell", full...)
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+// getDefenderExclusions returns the current Windows Defender path exclusions.
+// An error means Defender's preferences are unreachable (Defender disabled or
+// a third-party antivirus is in charge).
+func getDefenderExclusions() ([]string, error) {
+	out, err := runPowerShell("-Command", "(Get-MpPreference).ExclusionPath")
+	if err != nil {
+		return nil, fmt.Errorf("Get-MpPreference failed: %v (%s)", err, out)
+	}
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(strings.Trim(line, "\r")); line != "" {
+			paths = append(paths, line)
+		}
+	}
+	return paths, nil
+}
+
+// pathCoveredByExclusions reports whether path equals, or sits under, one of
+// the excluded directories (case-insensitive, the way Defender matches).
+func pathCoveredByExclusions(path string, exclusions []string) bool {
+	target := strings.ToLower(filepath.Clean(path))
+	for _, ex := range exclusions {
+		base := strings.ToLower(filepath.Clean(ex))
+		if target == base {
+			return true
+		}
+		if rel, err := filepath.Rel(base, target); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// DefenderStatus is the serializable Defender/app-folder state for the UI.
+type DefenderStatus struct {
+	AppDir     string   `json:"appDir"`
+	Excluded   bool     `json:"excluded"`
+	IsAdmin    bool     `json:"isAdmin"`
+	Available  bool     `json:"available"`
+	Exclusions []string `json:"exclusions,omitempty"`
+	Error      string   `json:"error,omitempty"`
+}
+
+// GetDefenderStatus reports whether the app's own folder (wherever the user
+// downloaded it) is covered by a Windows Defender path exclusion, plus the
+// admin state so the UI can warn about the upcoming UAC prompt.
+func (a *App) GetDefenderStatus() DefenderStatus {
+	st := DefenderStatus{IsAdmin: isElevated()}
+	exePath, err := os.Executable()
+	if err != nil {
+		st.Error = "cannot resolve app path: " + err.Error()
+		return st
+	}
+	st.AppDir = filepath.Dir(exePath)
+	excl, err := getDefenderExclusions()
+	if err != nil {
+		st.Error = err.Error()
+		return st
+	}
+	st.Available = true
+	st.Exclusions = excl
+	st.Excluded = pathCoveredByExclusions(st.AppDir, excl)
+	return st
+}
+
+// AddDefenderExclusion adds a Windows Defender path exclusion for the given
+// folder. Exclusions require administrator rights: when the app is not
+// elevated the command is re-run through a one-click UAC prompt
+// (Start-Process -Verb RunAs). The result is always verified by re-reading
+// Defender's exclusion list, because an elevated child cannot report its exit
+// code back through Start-Process.
+func (a *App) AddDefenderExclusion(path string) PatchResult {
+	abs, fail := validateExclusionPath(path)
+	if fail != nil {
+		return *fail
+	}
+	return addDefenderExclusionPath(abs)
+}
+
+// RemoveDefenderExclusion removes a folder from Defender's exclusion list
+// (same validation and one-click UAC flow as adding). When the folder has no
+// exact entry — e.g. it is only covered by a parent folder's exclusion —
+// nothing runs and an explanatory message is returned instead of a UAC prompt.
+func (a *App) RemoveDefenderExclusion(path string) PatchResult {
+	abs, fail := validateExclusionPath(path)
+	if fail != nil {
+		return *fail
+	}
+	excl, err := getDefenderExclusions()
+	if err != nil {
+		return PatchResult{Success: false, Message: "Defender status is unreadable: " + err.Error()}
+	}
+	if !exclusionListContains(excl, abs) {
+		if pathCoveredByExclusions(abs, excl) {
+			return PatchResult{Success: false, Message: "This folder has no exclusion entry of its own — it is covered by a parent folder's exclusion. Remove that one instead."}
+		}
+		return PatchResult{Success: false, Message: "This folder is not excluded."}
+	}
+	return removeDefenderExclusionPath(abs)
+}
+
+// IsPathExcluded reports whether the given folder is covered by a Windows
+// Defender path exclusion. Never elevates; false when Defender is unreachable.
+func (a *App) IsPathExcluded(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil || abs == "" {
+		return false
+	}
+	excl, err := getDefenderExclusions()
+	if err != nil {
+		return false
+	}
+	return pathCoveredByExclusions(abs, excl)
+}
+
+// validateExclusionPath checks a user-supplied exclusion folder and returns
+// its absolute form, or a failure result (never let a misclick exclude a
+// whole drive or Windows itself).
+func validateExclusionPath(path string) (string, *PatchResult) {
+	fail := func(msg string) (string, *PatchResult) {
+		r := PatchResult{Success: false, Message: msg}
+		return "", &r
+	}
+	clean := filepath.Clean(strings.TrimSpace(path))
+	if clean == "" || clean == "." {
+		return fail("Exclusion path cannot be empty")
+	}
+	abs, err := filepath.Abs(clean)
+	if err != nil || !filepath.IsAbs(abs) {
+		return fail("Exclusion path must be absolute: " + path)
+	}
+	if st, err := os.Stat(abs); err != nil || !st.IsDir() {
+		return fail("Folder does not exist: " + abs)
+	}
+	lower := strings.ToLower(abs)
+	if strings.HasSuffix(lower, ":\\") {
+		return fail("Refusing to exclude an entire drive: " + abs)
+	}
+	if sysRoot := os.Getenv("SystemRoot"); sysRoot != "" {
+		sr := strings.ToLower(filepath.Clean(sysRoot))
+		if lower == sr || strings.HasPrefix(lower, sr+string(os.PathSeparator)) {
+			return fail("Refusing to exclude a system location: " + abs)
+		}
+	}
+	return abs, nil
+}
+
+// exclusionListContains reports whether abs has an exact entry in Defender's
+// exclusion list (as opposed to merely being covered by a parent entry).
+func exclusionListContains(excl []string, abs string) bool {
+	want := filepath.Clean(abs)
+	for _, e := range excl {
+		if strings.EqualFold(filepath.Clean(e), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// addDefenderExclusionPath adds a validated absolute folder to Defender's
+// exclusion list (with a one-click UAC prompt when not elevated) and verifies
+// the result. Shared by the UI action and the automatic D3D9 pre-patch guard.
+func addDefenderExclusionPath(abs string) PatchResult {
+	writeLog(fmt.Sprintf("AddDefenderExclusion: requesting exclusion for %s (already elevated: %v)", abs, isElevated()))
+	out, err := runMpPreference("Add-MpPreference", abs)
+	if err != nil {
+		if strings.Contains(strings.ToLower(out), "cancel") {
+			writeLog("AddDefenderExclusion: elevation cancelled by user")
+			return PatchResult{Success: false, Message: "Elevation was cancelled — no changes were made."}
+		}
+		writeLog(fmt.Sprintf("AddDefenderExclusion: elevation command failed: %v (%s)", err, out))
+		return PatchResult{Success: false, Message: "Failed to add exclusion: " + firstNonEmptyLine(out, err.Error())}
+	}
+
+	excl, err := getDefenderExclusions()
+	if err != nil {
+		return PatchResult{Success: false, Message: "Exclusion command ran, but Defender status is unreadable: " + err.Error()}
+	}
+	if !pathCoveredByExclusions(abs, excl) {
+		return PatchResult{Success: false, Message: "Exclusion command ran but the folder is still not excluded. Defender may be managed by another antivirus."}
+	}
+	writeLog("AddDefenderExclusion: exclusion verified for " + abs)
+	return PatchResult{Success: true, Message: "Windows Defender now excludes:\n" + abs}
+}
+
+// removeDefenderExclusionPath removes a validated absolute folder from
+// Defender's exclusion list (with a one-click UAC prompt when not elevated)
+// and verifies the entry is gone.
+func removeDefenderExclusionPath(abs string) PatchResult {
+	writeLog(fmt.Sprintf("RemoveDefenderExclusion: removing exclusion for %s (already elevated: %v)", abs, isElevated()))
+	out, err := runMpPreference("Remove-MpPreference", abs)
+	if err != nil {
+		if strings.Contains(strings.ToLower(out), "cancel") {
+			writeLog("RemoveDefenderExclusion: elevation cancelled by user")
+			return PatchResult{Success: false, Message: "Elevation was cancelled — no changes were made."}
+		}
+		writeLog(fmt.Sprintf("RemoveDefenderExclusion: elevation command failed: %v (%s)", err, out))
+		return PatchResult{Success: false, Message: "Failed to remove exclusion: " + firstNonEmptyLine(out, err.Error())}
+	}
+
+	excl, err := getDefenderExclusions()
+	if err != nil {
+		return PatchResult{Success: false, Message: "Exclusion command ran, but Defender status is unreadable: " + err.Error()}
+	}
+	if exclusionListContains(excl, abs) {
+		return PatchResult{Success: false, Message: "Exclusion command ran but the entry is still listed."}
+	}
+	writeLog("RemoveDefenderExclusion: entry removed for " + abs)
+	if pathCoveredByExclusions(abs, excl) {
+		return PatchResult{Success: true, Message: "Exclusion entry removed, but the folder is still covered by a parent folder's exclusion."}
+	}
+	return PatchResult{Success: true, Message: "Defender exclusion removed for:\n" + abs}
+}
+
+// runMpPreference runs an Add/Remove-MpPreference cmdlet for abs via a temp
+// script, elevating through a one-click UAC prompt when needed. The folder
+// travels via environment variable so no quoting layer can mangle spaces on
+// the way to the (possibly elevated) PowerShell child, which inherits the
+// parent's environment across the UAC boundary. Returns trimmed output + err.
+// Note: callers must re-read the exclusion list afterwards, because an
+// elevated child cannot report its exit code back through Start-Process.
+func runMpPreference(cmdlet string, abs string) (string, error) {
+	script := "if ([string]::IsNullOrWhiteSpace($env:DLSS5_EXCLUDE_DIR)) { exit 2 }\n" + cmdlet + " -ExclusionPath $env:DLSS5_EXCLUDE_DIR\n"
+	tmp, err := os.CreateTemp("", "dlss5-exclude-*.ps1")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.WriteString(script); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return "", err
+	}
+	tmp.Close()
+	defer os.Remove(tmpName)
+
+	var cmd *exec.Cmd
+	if isElevated() {
+		cmd = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", tmpName)
+	} else {
+		// Each -ArgumentList element is individually single-quoted so spaces
+		// in the temp path survive intact.
+		argList := "'-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','" + tmpName + "'"
+		cmd = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+			"-Command", "Start-Process",
+			"-FilePath", "powershell",
+			"-ArgumentList", argList,
+			"-Verb", "RunAs",
+			"-Wait")
+	}
+	cmd.Env = append(os.Environ(), "DLSS5_EXCLUDE_DIR="+abs)
+	raw, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(raw)), err
+}
+
+// ensureDefenderExcluded makes sure path is covered by a Windows Defender
+// path exclusion, attempting a one-click (possibly elevated) exclusion when
+// needed. It returns nil once the folder is covered. When Defender's own
+// preferences are unreachable (disabled or a third-party AV is in charge)
+// there is nothing to enforce, so it also returns nil and callers proceed.
+func ensureDefenderExcluded(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("invalid path: %s", path)
+	}
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil || abs == "" {
+		return fmt.Errorf("invalid path: %s", path)
+	}
+	excl, err := getDefenderExclusions()
+	if err != nil {
+		writeLog("ensureDefenderExcluded: Defender unreachable, skipping enforcement (" + err.Error() + ")")
+		return nil
+	}
+	if pathCoveredByExclusions(abs, excl) {
+		writeLog("ensureDefenderExcluded: already covered: " + abs)
+		return nil
+	}
+	writeLog("ensureDefenderExcluded: not covered, requesting one-click exclusion for " + abs)
+	if res := addDefenderExclusionPath(abs); !res.Success {
+		return fmt.Errorf("%s", res.Message)
+	}
+	return nil
+}
+
+// firstNonEmptyLine returns the first non-empty line of s, falling back to fb.
+func firstNonEmptyLine(s, fb string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if line = strings.TrimSpace(strings.Trim(line, "\r")); line != "" {
+			return line
+		}
+	}
+	return fb
+}
+
+// DownloadURLs is the serializable download-URL block of config.json,
+// editable from the in-app Settings dialog.
+type DownloadURLs struct {
+	ReshadeSetupURL string `json:"reshade_setup_url"`
+	ReshadeURL      string `json:"reshade_url"`
+	OptiscalerURL   string `json:"optiscaler_url"`
+	Dlss5URL        string `json:"dlss5_url"`
+	DgvoodooURL     string `json:"dgvoodoo_url"`
+	DgvoodooAPI     string `json:"dgvoodoo_api"`
+	FeederURL       string `json:"feeder_url"`
+	NeuralConsumer  string `json:"neural_consumer"`
+}
+
+// GetDownloadURLs returns the configured dataset download URLs.
+func (a *App) GetDownloadURLs() DownloadURLs {
+	cfg := loadAppConfig()
+	return DownloadURLs{
+		ReshadeSetupURL: cfg.ReShadeSetupURL,
+		ReshadeURL:      cfg.ReShadeURL,
+		OptiscalerURL:   cfg.OptiScalerURL,
+		Dlss5URL:        cfg.DLSS5URL,
+		DgvoodooURL:     cfg.DgVoodooURL,
+		DgvoodooAPI:     cfg.DgVoodooAPI,
+		FeederURL:       cfg.FeederURL,
+		NeuralConsumer:  cfg.NeuralConsumer,
+	}
+}
+
+// SaveDownloadURLs persists the dataset download URLs to config.json,
+// preserving every other setting (e.g. the GPU selection).
+func (a *App) SaveDownloadURLs(urls DownloadURLs) PatchResult {
+	cfg := loadAppConfig()
+	cfg.ReShadeSetupURL = strings.TrimSpace(urls.ReshadeSetupURL)
+	cfg.ReShadeURL = strings.TrimSpace(urls.ReshadeURL)
+	cfg.OptiScalerURL = strings.TrimSpace(urls.OptiscalerURL)
+	cfg.DLSS5URL = strings.TrimSpace(urls.Dlss5URL)
+	cfg.DgVoodooURL = strings.TrimSpace(urls.DgvoodooURL)
+	cfg.DgVoodooAPI = normalizeDgVoodooAPI(urls.DgvoodooAPI)
+	cfg.FeederURL = strings.TrimSpace(urls.FeederURL)
+	cfg.NeuralConsumer = normalizeNeuralConsumer(urls.NeuralConsumer)
+	if err := writeAppConfig(cfg); err != nil {
+		writeLog("SaveDownloadURLs: ERROR - " + err.Error())
+		return PatchResult{Success: false, Message: "Failed to save config.json: " + err.Error()}
+	}
+	writeLog("SaveDownloadURLs: settings updated (dgvoodoo output: " + cfg.DgVoodooAPI + ", neural consumer: " + cfg.NeuralConsumer + ")")
+	return PatchResult{Success: true, Message: "Settings saved."}
+}
+
+// OpenGameFolder opens the game's folder in Windows Explorer. Accepts either
+// the folder itself or a file inside it.
+func (a *App) OpenGameFolder(gamePath string) PatchResult {
+	clean := filepath.Clean(strings.TrimSpace(gamePath))
+	if clean == "" || clean == "." {
+		return PatchResult{Success: false, Message: "Game path cannot be empty"}
+	}
+	if st, err := os.Stat(clean); err != nil {
+		return PatchResult{Success: false, Message: "Folder not found: " + clean}
+	} else if !st.IsDir() {
+		clean = filepath.Dir(clean)
+	}
+	abs, err := filepath.Abs(clean)
+	if err != nil {
+		return PatchResult{Success: false, Message: "Failed to resolve path: " + err.Error()}
+	}
+	writeLog("OpenGameFolder: opening " + abs)
+	if err := exec.Command("explorer.exe", abs).Start(); err != nil {
+		return PatchResult{Success: false, Message: "Failed to open Explorer: " + err.Error()}
+	}
+	return PatchResult{Success: true, Message: "Opened in Explorer: " + abs}
+}
+
 // GetAppVersion returns the application version
 func (a *App) GetAppVersion() string {
-	return "1.2.0"
+	return "1.4.0"
 }
 
 // GetSystemInfo returns system information including detected GPU

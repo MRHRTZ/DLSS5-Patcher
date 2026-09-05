@@ -3,5 +3,9 @@
   "reshade_setup_url": "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe",
   "reshade_url": "",
   "optiscaler_url": "",
-  "dlss5_url": ""
+  "dlss5_url": "",
+  "dgvoodoo_url": "https://github.com/dege-diosg/dgVoodoo2/releases/download/v2.87.4/dgVoodoo2_87_4.zip",
+  "dgvoodoo_api": "d3d11",
+  "feeder_url": "https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/download/v0.13.1-beta.1/DLSS5-Feeder-0.13.1-beta.1.zip",
+  "neural_consumer": "renodx"
 }
