@@ -1,7 +1,7 @@
+build/
 AGENTS.md
 patcher.log
 Setup.txt
 *.exe
-/*.bat
 *.dll
 *.zip
