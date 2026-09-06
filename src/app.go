@@ -590,9 +590,9 @@ func defaultAppConfig() appConfig {
 	return appConfig{
 		GPUSelection:    "",
 		ReShadeSetupURL: "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe",
-		ReShadeURL:      "https://example.com/dlss5/reshade.zip",
-		OptiScalerURL:   "https://example.com/dlss5/optiscaler.zip",
-		DLSS5URL:        "https://example.com/dlss5/dlss5.zip",
+		ReShadeURL:      "https://github.com/MRHRTZ/DLSS5-Patcher/releases/download/v1.2.1/reshade.v1.2.1.zip",
+		OptiScalerURL:   "https://github.com/MRHRTZ/DLSS5-Patcher/releases/download/v1.2.1/optiscaler.v1.2.1.zip",
+		DLSS5URL:        "https://github.com/MRHRTZ/DLSS5-Patcher/releases/download/v1.2.1/dlss5.v1.2.1.zip",
 		DgVoodooURL:     "https://github.com/dege-diosg/dgVoodoo2/releases/download/v2.87.4/dgVoodoo2_87_4.zip",
 		DgVoodooAPI:     "d3d11",
 		FeederURL:       "https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/download/v0.13.1-beta.1/DLSS5-Feeder-0.13.1-beta.1.zip",
@@ -1262,24 +1262,24 @@ type DLLDetail struct {
 
 // GameDetails represents full status, version details, and DLL lists for UI
 type GameDetails struct {
-	Name             string      `json:"name"`
-	Path             string      `json:"path"`
-	Executable       string      `json:"executable"`
-	RenderingAPI     string      `json:"renderingAPI"`
-	DLSSVersion      string      `json:"dlssVersion"`
-	DLSS5Addon       string      `json:"dlss5Addon"`
-	ReshadeStatus    string      `json:"reshadeStatus"`
-	OptiScalerStatus string      `json:"optiScalerStatus"`
-	DgVoodooStatus   string      `json:"dgvoodooStatus"`
+	Name             string `json:"name"`
+	Path             string `json:"path"`
+	Executable       string `json:"executable"`
+	RenderingAPI     string `json:"renderingAPI"`
+	DLSSVersion      string `json:"dlssVersion"`
+	DLSS5Addon       string `json:"dlss5Addon"`
+	ReshadeStatus    string `json:"reshadeStatus"`
+	OptiScalerStatus string `json:"optiScalerStatus"`
+	DgVoodooStatus   string `json:"dgvoodooStatus"`
 	// RecommendsReShade is true when OptiScaler has no path for the game's
 	// API (D3D8/D3D9/D3D10/OpenGL), so the UI must default to ReShade mode.
-	RecommendsReShade bool `json:"recommendsReShade"`
-	Is32Bit          bool        `json:"is32Bit"`
-	IsInstalled      bool        `json:"isInstalled"`
-	DLLList          []DLLDetail `json:"dllList"`
-	GPUName          string      `json:"gpuName"`
-	NeuralSupport    bool        `json:"neuralSupport"`
-	NeuralNote       string      `json:"neuralNote"`
+	RecommendsReShade bool        `json:"recommendsReShade"`
+	Is32Bit           bool        `json:"is32Bit"`
+	IsInstalled       bool        `json:"isInstalled"`
+	DLLList           []DLLDetail `json:"dllList"`
+	GPUName           string      `json:"gpuName"`
+	NeuralSupport     bool        `json:"neuralSupport"`
+	NeuralNote        string      `json:"neuralNote"`
 	// NeuralNoteLevel is "info" for informational guidance (e.g. DX11 → use ReShade)
 	// or "warning" for hard limitations (e.g. NR unsupported on this GPU). Defaults
 	// to "warning" when empty.
